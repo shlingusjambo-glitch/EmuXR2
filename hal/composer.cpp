@@ -7,6 +7,7 @@ using namespace vendor::oculus::hardware::graphics::composer::V1_1;
 using ::android::hardware::Return;
 
 static int32_t gRate = 72;
+int32_t composerRate() { return gRate; }
 struct MacVRComposer : public IComposer {
     Return<bool> isVariableRefreshRateSupported() override { return false; }
     Return<int32_t> setVariableRefreshRateEnabled(bool) override { return 0; }

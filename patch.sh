@@ -26,6 +26,11 @@ cp -c emu/emu_vendor.img emu/emu_vendor.orig; unshare emu/emu_vendor.img 600M em
 x work/system.img /system/build.prop work/build.prop
 sed -i '' -e 's/^ro.adb.secure=1/ro.adb.secure=0/' -e 's/^ro.debuggable=0/ro.debuggable=1/' -e 's/^ro.secure=1/ro.secure=0/' work/build.prop
 put work/system.img work/build.prop /system/build.prop
+# the Quest's device compatibility matrix requires its Qualcomm display HALs; the emulator's vendor has none of them,
+# and an unmet matrix makes Android show a focus-stealing "internal problem with your device" dialog
+x work/system.img /system/etc/vintf/compatibility_matrix.device.xml work/cm.device.xml
+sed -i '' 's/optional="false"/optional="true"/' work/cm.device.xml
+put work/system.img work/cm.device.xml /system/etc/vintf/compatibility_matrix.device.xml
 # SELinux: every domain permissive (Quest platform policy + emulator vendor policy don't line up)
 x work/system.img /system/etc/selinux/plat_sepolicy.cil work/plat_sepolicy.cil
 x emu/emu_vendor.img /etc/selinux/vendor_sepolicy.cil work/vendor_sepolicy.cil
@@ -38,6 +43,10 @@ put emu/emu_vendor.img work/vendor_sepolicy.cil /etc/selinux/vendor_sepolicy.cil
 x emu/emu_vendor.img /build.prop work/vbuild.prop
 sed -i '' -e 's/^ro.apex.updatable=true/ro.apex.updatable=false/' -e 's/^ro.zygote=zygote64$/ro.zygote=zygote64_stub32/' work/vbuild.prop
 cat "$H/vendor.prop" >> work/vbuild.prop
+# the system's fingerprint, or Android warns "There's an internal problem with your device" and that dialog keeps focus
+x work/system.img /system/build.prop work/sbuild.prop
+FP=$(sed -n 's/^ro.system.build.fingerprint=//p' work/sbuild.prop)
+sed -i '' "s|^ro.vendor.build.fingerprint=.*|ro.vendor.build.fingerprint=$FP|" work/vbuild.prop
 put emu/emu_vendor.img work/vbuild.prop /build.prop
 # AOSP binaries taken from the emulator's own system partition (extracted once, cached in aosp/)
 AOSP="bin/mediaserver bin/drmserver lib64/libmediaplayerservice.so lib64/libresourcemanagerservice.so lib64/libstagefright_httplive.so"

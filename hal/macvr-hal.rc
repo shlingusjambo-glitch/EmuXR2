@@ -3,3 +3,16 @@ service macvr-hal /vendor/bin/hw/macvr-hal
     user system
     group system
     seclabel u:r:hal_graphics_composer_default:s0
+
+# the emulator's adb runs over a qemu pipe, not USB: keep it up when Horizon turns USB debugging off
+on property:sys.usb.config=none
+    start adbd
+
+# the display vsync node Meta's compositor reads (written by macvr-hal; see vsync.cpp)
+on init
+    mount tmpfs tmpfs /sys/class/drm mode=0755,uid=0,gid=1000
+    symlink ../../devices/virtual/drm/ttm /sys/class/drm/ttm
+    mkdir /sys/class/drm/sde-crtc-0 0755 system system
+    write /sys/class/drm/sde-crtc-0/vsync_event "VSYNC=0"
+    chown system system /sys/class/drm/sde-crtc-0/vsync_event
+    chmod 0644 /sys/class/drm/sde-crtc-0/vsync_event

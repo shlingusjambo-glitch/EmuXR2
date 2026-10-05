@@ -239,7 +239,11 @@ static void *workerMain(void *u) {
 }
 
 // extensions the wrapper provides itself (removed before the driver sees them)
-static const char *emulated[] = {VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME};
+// (VK_KHR_multiview is core in 1.1; the guest driver supports it but does not list the name, which ANGLE checks for)
+// VK_EXT_line_rasterization is only claimed (Bresenham lines) because ANGLE exposes GL_OVR_multiview only with it;
+// lines are rasterized however the host driver draws them by default.
+static const char *emulated[] = {VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME, VK_KHR_MULTIVIEW_EXTENSION_NAME,
+    VK_EXT_LINE_RASTERIZATION_EXTENSION_NAME};
 
 // ---- instance level ----
 static VkResult EnumerateDeviceExtensionProperties(VkPhysicalDevice pd, const char *layer, uint32_t *count, VkExtensionProperties *props) {
@@ -290,7 +294,16 @@ static VkResult CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, 
             if (!on && ok) ext[m++] = need[k];
         }
     VkDeviceCreateInfo c = *ci; c.enabledExtensionCount = m; c.ppEnabledExtensionNames = ext;
+    // the line rasterization features struct is ours: unlink it for the call
+    VkBaseOutStructure *prev = (VkBaseOutStructure *)&c, *lineFeat = NULL;
+    for (; prev->pNext; prev = prev->pNext)
+        if (prev->pNext->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES_EXT) { lineFeat = prev->pNext; prev->pNext = lineFeat->pNext; break; }
+    for (uint32_t i = 0; i < m; i++) {
+        int ok = 0; for (uint32_t j = 0; j < n; j++) if (!strcmp(avail[j].extensionName, ext[i])) ok = 1;
+        if (!ok) LOG("vkCreateDevice: driver lacks %s", ext[i]);
+    }
     VkResult r = f(pd, &c, a, out);
+    if (lineFeat) prev->pNext = lineFeat;
     free(ext); free(avail);
     if (r != VK_SUCCESS) { LOG("vkCreateDevice failed %d", r); return r; }
     pthread_mutex_lock(&lock);
@@ -341,6 +354,18 @@ static void GetPhysicalDeviceExternalBufferProperties(VkPhysicalDevice pd, const
 }
 
 // opaque-fd images are supported whenever the format is (layers and mips go through shadows)
+// the guest driver passes the host's hostQueryReset feature through but has no vkResetQueryPool
+static void GetPhysicalDeviceFeatures2(VkPhysicalDevice pd, VkPhysicalDeviceFeatures2 *out) {
+    PFN_vkGetPhysicalDeviceFeatures2 f = (void *)IPA("vkGetPhysicalDeviceFeatures2");
+    if (!f) f = (void *)IPA("vkGetPhysicalDeviceFeatures2KHR");
+    f(pd, out);
+    VkPhysicalDeviceHostQueryResetFeatures *h = (void *)find(out->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES);
+    if (h) h->hostQueryReset = VK_FALSE;
+    VkPhysicalDeviceVulkan12Features *v = (void *)find(out->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES);
+    if (v) v->hostQueryReset = VK_FALSE;
+    VkPhysicalDeviceLineRasterizationFeaturesEXT *l = (void *)find(out->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES_EXT);
+    if (l) { memset(&l->rectangularLines, 0, 6 * sizeof(VkBool32)); l->bresenhamLines = VK_TRUE; }
+}
 static VkResult GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice pd, const VkPhysicalDeviceImageFormatInfo2 *info, VkImageFormatProperties2 *out) {
     PFN_vkGetPhysicalDeviceImageFormatProperties2 f = (void *)IPA("vkGetPhysicalDeviceImageFormatProperties2");
     if (!f) f = (void *)IPA("vkGetPhysicalDeviceImageFormatProperties2KHR");
@@ -361,7 +386,8 @@ static VkResult CreateImage(VkDevice dev, const VkImageCreateInfo *ci, const VkA
     Dev *d = findDev(dev);
     const VkExternalMemoryImageCreateInfo *e = (const void *)find(ci->pNext, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
     if (!e || !(e->handleTypes & OPAQUE)) return d->CreateImage(dev, ci, a, out);
-    int complex = ci->arrayLayers > 1 || ci->mipLevels > 1 || ci->imageType != VK_IMAGE_TYPE_2D || ci->samples != VK_SAMPLE_COUNT_1_BIT
+    // Native Android buffers cannot carry storage-image usage on the Mac host driver.
+    int complex = (ci->usage & VK_IMAGE_USAGE_STORAGE_BIT) || ci->arrayLayers > 1 || ci->mipLevels > 1 || ci->imageType != VK_IMAGE_TYPE_2D || ci->samples != VK_SAMPLE_COUNT_1_BIT
                   || ci->arrayLayers * ci->mipLevels > MAXSH;
     VkImageCreateInfo c = *ci; VkResult r;
     if (complex) {   // an ordinary image; sharing goes through shadows
@@ -836,6 +862,8 @@ static PFN_vkVoidFunction GetInstanceProcAddr(VkInstance inst, const char *n) {
     HOOK("vkGetPhysicalDeviceExternalBufferProperties", GetPhysicalDeviceExternalBufferProperties);
     HOOK("vkGetPhysicalDeviceExternalBufferPropertiesKHR", GetPhysicalDeviceExternalBufferProperties);
     HOOK("vkGetPhysicalDeviceImageFormatProperties2", GetPhysicalDeviceImageFormatProperties2);
+    HOOK("vkGetPhysicalDeviceFeatures2", GetPhysicalDeviceFeatures2);
+    HOOK("vkGetPhysicalDeviceFeatures2KHR", GetPhysicalDeviceFeatures2);
     HOOK("vkGetPhysicalDeviceImageFormatProperties2KHR", GetPhysicalDeviceImageFormatProperties2);
     PFN_vkVoidFunction h = deviceHook(n);
     if (h) return h;
@@ -845,6 +873,15 @@ static PFN_vkVoidFunction GetInstanceProcAddr(VkInstance inst, const char *n) {
 static VkResult CreateInstance(const VkInstanceCreateInfo *ci, const VkAllocationCallbacks *a, VkInstance *out) {
     VkResult r = realDev->CreateInstance(ci, a, out);
     if (r == VK_SUCCESS) gInst = *out;
+    else {
+        uint32_t n = 0; realDev->EnumerateInstanceExtensionProperties(NULL, &n, NULL);
+        VkExtensionProperties *p = calloc(n, sizeof *p); realDev->EnumerateInstanceExtensionProperties(NULL, &n, p);
+        for (uint32_t i = 0; i < ci->enabledExtensionCount; i++) {
+            int ok = 0; for (uint32_t j = 0; j < n; j++) if (!strcmp(p[j].extensionName, ci->ppEnabledExtensionNames[i])) ok = 1;
+            if (!ok) LOG("vkCreateInstance %d: driver lacks %s", r, ci->ppEnabledExtensionNames[i]);
+        }
+        free(p);
+    }
     return r;
 }
 

@@ -1,0 +1,290 @@
+// Lifecycle and host-memory adapter for a guest with no Qualcomm DSP.
+// No camera frames are supplied by macvr-hal. Compute entry points fail with
+// ENOSYS instead of claiming to have processed sensor or neural-network data.
+#include <errno.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <android/log.h>
+int hexagon_init(void) { return 0; }
+void hexagon_shutdown(void) {}
+const char *HexagonGetRevision(void) { return "EmuXR2-no-DSP"; }
+int HexagonGetABIVersion(void) { return 98; }
+int HexagonVersionCheck(void) { return 0; }
+int hexagon_getABIVersion_if(int *v) { if (v) *v = 98; return 0; }
+int hexagon_getDspVersion_if(int *v) { if (v) *v = 0; return 0; }
+int hexagon_getRevision_if(char *s, int n) { if (s && n > 0) { strncpy(s, HexagonGetRevision(), n); s[n-1] = 0; } return 0; }
+int hexagon_getNumOfHwThreads_if(int *v) { if (v) *v = 1; return 0; }
+void HexagonRPCMemInit(void) {}
+void HexagonRPCMemDeinit(void) {}
+struct Allocation { void *ptr; size_t size; int fd; struct Allocation *next; };
+static struct Allocation *allocations;
+static pthread_mutex_t memory_lock = PTHREAD_MUTEX_INITIALIZER;
+void *HexagonRPCMemAlloc(int heap, unsigned flags, int size) {
+    if (size <= 0) return NULL;
+    int fd = memfd_create("macvr-dsp", MFD_CLOEXEC);
+    if (fd < 0 || ftruncate(fd, size)) { if (fd >= 0) close(fd); return NULL; }
+    void *ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (ptr == MAP_FAILED) { close(fd); return NULL; }
+    struct Allocation *a = calloc(1, sizeof *a);
+    if (!a) { munmap(ptr, size); close(fd); return NULL; }
+    *a = (struct Allocation){ptr, size, fd, NULL};
+    pthread_mutex_lock(&memory_lock); a->next = allocations; allocations = a; pthread_mutex_unlock(&memory_lock);
+    return ptr;
+}
+void HexagonRPCMemFree(void *ptr) {
+    pthread_mutex_lock(&memory_lock);
+    struct Allocation **p = &allocations;
+    while (*p && (*p)->ptr != ptr) p = &(*p)->next;
+    struct Allocation *a = *p; if (a) *p = a->next;
+    pthread_mutex_unlock(&memory_lock);
+    if (a) { munmap(a->ptr, a->size); close(a->fd); free(a); }
+}
+int HexagonRPCMemToFD(void *ptr) {
+    pthread_mutex_lock(&memory_lock); int fd = -1;
+    for (struct Allocation *a = allocations; a; a = a->next) if (a->ptr == ptr) { fd = a->fd; break; }
+    pthread_mutex_unlock(&memory_lock); return fd;
+}
+int hexagon_rpcMemTest_if(const void *in, int inSize, void *out, int outSize) {
+    if (!in || !out || inSize < 0 || outSize < inSize) return -EINVAL;
+    memcpy(out, in, inSize); return 0;
+}
+#define LIFECYCLE(name) int name(void) { return 0; }
+#define UNSUPPORTED(name) int name(void) { __android_log_print(ANDROID_LOG_WARN, "MacVR-DSP", "unsupported DSP operation: " #name); return -ENOSYS; }
+LIFECYCLE(HexagonCaptureClearFunctionToggles)
+LIFECYCLE(HexagonCaptureDisableAllFunctions)
+LIFECYCLE(HexagonCaptureDisableFunction)
+LIFECYCLE(HexagonCaptureEnableFunction)
+LIFECYCLE(HexagonCaptureEnabled)
+LIFECYCLE(HexagonCaptureRegisterSetUseSFRPC)
+LIFECYCLE(HexagonCaptureStart)
+LIFECYCLE(HexagonCaptureStop)
+LIFECYCLE(HexagonRPCPersistentMemMap)
+LIFECYCLE(HexagonRPCPersistentMemUnmap)
+LIFECYCLE(boltCvp_close)
+UNSUPPORTED(boltCvp_deinitDfs)
+UNSUPPORTED(boltCvp_deinitDfs_if)
+UNSUPPORTED(boltCvp_deinitDs)
+UNSUPPORTED(boltCvp_deinitDs_if)
+UNSUPPORTED(boltCvp_deinitFpx)
+UNSUPPORTED(boltCvp_deinitFpx_if)
+UNSUPPORTED(boltCvp_deinitOf)
+UNSUPPORTED(boltCvp_deinitOf_if)
+UNSUPPORTED(boltCvp_deinitWarper)
+UNSUPPORTED(boltCvp_deinitWarper_if)
+UNSUPPORTED(boltCvp_getABIVersion)
+int boltCvp_getABIVersion_if(int *v) { if (v) *v = 97; return 0; }
+UNSUPPORTED(boltCvp_getDfsHandleSize)
+UNSUPPORTED(boltCvp_getDfsHandleSize_if)
+UNSUPPORTED(boltCvp_getDsHandleSize)
+UNSUPPORTED(boltCvp_getDsHandleSize_if)
+UNSUPPORTED(boltCvp_getFpxHandleSize)
+UNSUPPORTED(boltCvp_getFpxHandleSize_if)
+UNSUPPORTED(boltCvp_getOfHandleSize)
+UNSUPPORTED(boltCvp_getOfHandleSize_if)
+UNSUPPORTED(boltCvp_getOutputBuffSize)
+UNSUPPORTED(boltCvp_getOutputBuffSize_if)
+UNSUPPORTED(boltCvp_getRevision)
+int boltCvp_getRevision_if(char *s, int n) { return hexagon_getRevision_if(s, n); }
+UNSUPPORTED(boltCvp_getWarperHandleSize)
+UNSUPPORTED(boltCvp_getWarperHandleSize_if)
+LIFECYCLE(boltCvp_init)
+UNSUPPORTED(boltCvp_initDfs)
+UNSUPPORTED(boltCvp_initDfs_if)
+UNSUPPORTED(boltCvp_initDs)
+UNSUPPORTED(boltCvp_initDs_if)
+UNSUPPORTED(boltCvp_initFpx)
+UNSUPPORTED(boltCvp_initFpx_if)
+UNSUPPORTED(boltCvp_initOf)
+UNSUPPORTED(boltCvp_initOf_if)
+UNSUPPORTED(boltCvp_initWarper)
+UNSUPPORTED(boltCvp_initWarper_if)
+LIFECYCLE(boltCvp_open)
+UNSUPPORTED(boltCvp_setClocks)
+UNSUPPORTED(boltCvp_setClocks_if)
+LIFECYCLE(boltCvp_shutdown)
+UNSUPPORTED(boltCvp_skel_handle_invoke)
+UNSUPPORTED(boltCvp_syncDfs)
+UNSUPPORTED(boltCvp_syncDfs_if)
+UNSUPPORTED(boltCvp_syncDs)
+UNSUPPORTED(boltCvp_syncDs_if)
+UNSUPPORTED(boltCvp_syncFpx)
+UNSUPPORTED(boltCvp_syncFpx_if)
+UNSUPPORTED(boltCvp_syncOf)
+UNSUPPORTED(boltCvp_syncOf_if)
+UNSUPPORTED(boltCvp_syncWarp)
+UNSUPPORTED(boltCvp_syncWarp_if)
+UNSUPPORTED(dfs_applyGaussianBlur)
+UNSUPPORTED(dfs_applyGaussianBlur_if)
+LIFECYCLE(dfs_close)
+UNSUPPORTED(dfs_compute)
+UNSUPPORTED(dfs_compute_if)
+UNSUPPORTED(dfs_cvpComputeCoreDisparity)
+UNSUPPORTED(dfs_cvpComputeCoreDisparity_if)
+LIFECYCLE(dfs_cvpCoreDisparityDeinit)
+LIFECYCLE(dfs_cvpCoreDisparityDeinit_if)
+LIFECYCLE(dfs_cvpCoreDisparityInit)
+LIFECYCLE(dfs_cvpCoreDisparityInit_if)
+UNSUPPORTED(dfs_cvpGetPipelineNumBytes)
+UNSUPPORTED(dfs_cvpGetPipelineNumBytes_if)
+UNSUPPORTED(dfs_find_peaks)
+UNSUPPORTED(dfs_find_peaks_if)
+UNSUPPORTED(dfs_getABIVersion)
+int dfs_getABIVersion_if(int *v) { if (v) *v = 97; return 0; }
+UNSUPPORTED(dfs_getRevision)
+int dfs_getRevision_if(char *s, int n) { return hexagon_getRevision_if(s, n); }
+LIFECYCLE(dfs_init)
+LIFECYCLE(dfs_open)
+LIFECYCLE(dfs_passthroughMeshDeinit)
+LIFECYCLE(dfs_passthroughMeshDeinit_if)
+LIFECYCLE(dfs_passthroughMeshInit)
+LIFECYCLE(dfs_passthroughMeshInit_if)
+UNSUPPORTED(dfs_passthroughMeshSolve)
+UNSUPPORTED(dfs_passthroughMeshSolve_if)
+UNSUPPORTED(dfs_rotate)
+UNSUPPORTED(dfs_rotate_if)
+UNSUPPORTED(dfs_scanning_pipeline)
+UNSUPPORTED(dfs_scanning_pipeline_if)
+LIFECYCLE(dfs_shutdown)
+UNSUPPORTED(dfs_skel_handle_invoke)
+UNSUPPORTED(dfs_subpixel_refine_global)
+UNSUPPORTED(dfs_subpixel_refine_global_if)
+UNSUPPORTED(dfs_warp_image_bilinear)
+UNSUPPORTED(dfs_warp_image_bilinear_if)
+LIFECYCLE(hexagon_close)
+UNSUPPORTED(hexagon_computeOrbDesc)
+UNSUPPORTED(hexagon_computeOrbDesc2xScale)
+UNSUPPORTED(hexagon_computeOrbDesc2xScale_if)
+UNSUPPORTED(hexagon_computeOrbDesc_if)
+UNSUPPORTED(hexagon_descriptorIndexSearch)
+UNSUPPORTED(hexagon_descriptorIndexSearch_if)
+UNSUPPORTED(hexagon_dspEater2)
+UNSUPPORTED(hexagon_dspEater2_if)
+UNSUPPORTED(hexagon_dspEaterSetup)
+UNSUPPORTED(hexagon_dspEaterSetup_if)
+UNSUPPORTED(hexagon_dspEaterTeardown)
+UNSUPPORTED(hexagon_dspEaterTeardown_if)
+UNSUPPORTED(hexagon_gammaCompression)
+UNSUPPORTED(hexagon_gammaCompression_if)
+UNSUPPORTED(hexagon_getABIVersion)
+UNSUPPORTED(hexagon_getDspVersion)
+UNSUPPORTED(hexagon_getNumOfHwThreads)
+UNSUPPORTED(hexagon_getRevision)
+UNSUPPORTED(hexagon_hapMemGetStats)
+UNSUPPORTED(hexagon_hapMemGetStats_if)
+UNSUPPORTED(hexagon_harrisCornerIndexedSlices)
+UNSUPPORTED(hexagon_harrisCornerIndexedSlices_if)
+LIFECYCLE(hexagon_hvxOff)
+LIFECYCLE(hexagon_hvxOff_if)
+LIFECYCLE(hexagon_hvxOn)
+LIFECYCLE(hexagon_hvxOnWithMips)
+LIFECYCLE(hexagon_hvxOnWithMips_if)
+LIFECYCLE(hexagon_hvxOn_if)
+UNSUPPORTED(hexagon_lineSrch)
+UNSUPPORTED(hexagon_lineSrch_if)
+UNSUPPORTED(hexagon_logDestroy)
+UNSUPPORTED(hexagon_logDestroy_if)
+LIFECYCLE(hexagon_logInit)
+LIFECYCLE(hexagon_logInit_if)
+LIFECYCLE(hexagon_logStart)
+LIFECYCLE(hexagon_logStart_if)
+LIFECYCLE(hexagon_logStop)
+LIFECYCLE(hexagon_logStop_if)
+UNSUPPORTED(hexagon_mapIonMemory)
+UNSUPPORTED(hexagon_mapIonMemory_if)
+UNSUPPORTED(hexagon_memtest)
+UNSUPPORTED(hexagon_memtest_if)
+LIFECYCLE(hexagon_nnAddConstNode)
+LIFECYCLE(hexagon_nnAddConstNode_if)
+LIFECYCLE(hexagon_nnAddConstNodes)
+LIFECYCLE(hexagon_nnAddConstNodesV2)
+LIFECYCLE(hexagon_nnAddConstNodesV2_if)
+LIFECYCLE(hexagon_nnAddConstNodes_if)
+LIFECYCLE(hexagon_nnAddHTASubgraphNode)
+LIFECYCLE(hexagon_nnAddHTASubgraphNode_if)
+LIFECYCLE(hexagon_nnAddNode)
+LIFECYCLE(hexagon_nnAddNodeByOpName)
+LIFECYCLE(hexagon_nnAddNodeByOpName_if)
+LIFECYCLE(hexagon_nnAddNode_if)
+LIFECYCLE(hexagon_nnAddNodesByOpName)
+LIFECYCLE(hexagon_nnAddNodesByOpName_if)
+UNSUPPORTED(hexagon_nnDestroy)
+UNSUPPORTED(hexagon_nnDestroy_if)
+UNSUPPORTED(hexagon_nnExecute)
+UNSUPPORTED(hexagon_nnExecuteEx)
+UNSUPPORTED(hexagon_nnExecuteEx_if)
+UNSUPPORTED(hexagon_nnExecute_if)
+UNSUPPORTED(hexagon_nnExecutorchCreateModel)
+UNSUPPORTED(hexagon_nnExecutorchCreateModel_if)
+UNSUPPORTED(hexagon_nnFetchIntermediateOutput)
+UNSUPPORTED(hexagon_nnFetchIntermediateOutput_if)
+UNSUPPORTED(hexagon_nnFlatbuffersDestroy)
+UNSUPPORTED(hexagon_nnFlatbuffersDestroy_if)
+UNSUPPORTED(hexagon_nnFlatbuffersGetLog)
+UNSUPPORTED(hexagon_nnFlatbuffersGetLogSize)
+UNSUPPORTED(hexagon_nnFlatbuffersGetLogSize_if)
+UNSUPPORTED(hexagon_nnFlatbuffersGetLog_if)
+UNSUPPORTED(hexagon_nnFlatbuffersGetPerfInfo)
+UNSUPPORTED(hexagon_nnFlatbuffersGetPerfInfo_if)
+LIFECYCLE(hexagon_nnFlatbuffersInit)
+int hexagon_nnFlatbuffersInit_if(void *data, int size, void *config, unsigned *id, int flags, const char *name, int nameSize) { static unsigned next = 1; if (!id) return -EINVAL; *id = next++; return 0; }
+UNSUPPORTED(hexagon_nnFlatbuffersRun)
+UNSUPPORTED(hexagon_nnFlatbuffersRunDebug)
+UNSUPPORTED(hexagon_nnFlatbuffersRunDebug_if)
+UNSUPPORTED(hexagon_nnFlatbuffersRun_if)
+UNSUPPORTED(hexagon_nnFlatbuffersSetDebugLevel)
+UNSUPPORTED(hexagon_nnFlatbuffersSetDebugLevel_if)
+UNSUPPORTED(hexagon_nnGetLog)
+UNSUPPORTED(hexagon_nnGetLogSize)
+int hexagon_nnGetLogSize_if(unsigned *size) { if (size) *size = 1; return 0; }
+int hexagon_nnGetLog_if(char *out, int size) { if (out && size > 0) out[0] = 0; return 0; }
+UNSUPPORTED(hexagon_nnGetMemoryUsage)
+UNSUPPORTED(hexagon_nnGetMemoryUsage_if)
+UNSUPPORTED(hexagon_nnGetPerfInfo)
+UNSUPPORTED(hexagon_nnGetPerfInfo_if)
+LIFECYCLE(hexagon_nnInit)
+int hexagon_nnInit_if(unsigned *id) { if (!id) return -EINVAL; *id = 1; return 0; }
+LIFECYCLE(hexagon_nnPrepare)
+LIFECYCLE(hexagon_nnPrepare_if)
+UNSUPPORTED(hexagon_nnResetPerfInfo)
+UNSUPPORTED(hexagon_nnResetPerfInfo_if)
+LIFECYCLE(hexagon_nnSetDebugLevel)
+LIFECYCLE(hexagon_nnSetDebugLevel_if)
+LIFECYCLE(hexagon_nnStart)
+LIFECYCLE(hexagon_nnStart_if)
+LIFECYCLE(hexagon_nnStop)
+LIFECYCLE(hexagon_nnStop_if)
+LIFECYCLE(hexagon_nnThreadPoolLogDeinit)
+LIFECYCLE(hexagon_nnThreadPoolLogDeinit_if)
+LIFECYCLE(hexagon_nnThreadPoolLogInit)
+LIFECYCLE(hexagon_nnThreadPoolLogInit_if)
+UNSUPPORTED(hexagon_nnVersion)
+LIFECYCLE(hexagon_nnVersionCheck)
+LIFECYCLE(hexagon_nnVersionCheck_if)
+UNSUPPORTED(hexagon_nnVersion_if)
+LIFECYCLE(hexagon_open)
+LIFECYCLE(hexagon_orbDeinit)
+LIFECYCLE(hexagon_orbDeinit_if)
+LIFECYCLE(hexagon_orbInit)
+LIFECYCLE(hexagon_orbInit_if)
+LIFECYCLE(hexagon_patchDeinit)
+LIFECYCLE(hexagon_patchDeinit_if)
+LIFECYCLE(hexagon_patchInit)
+LIFECYCLE(hexagon_patchInit_if)
+UNSUPPORTED(hexagon_patchSrch)
+UNSUPPORTED(hexagon_patchSrch_if)
+UNSUPPORTED(hexagon_patchWarpSrch)
+UNSUPPORTED(hexagon_patchWarpSrch_if)
+UNSUPPORTED(hexagon_pyr2x2)
+UNSUPPORTED(hexagon_pyr2x2_if)
+UNSUPPORTED(hexagon_pyr3x3)
+UNSUPPORTED(hexagon_pyr3x3_if)
+UNSUPPORTED(hexagon_raw10ToRaw8)
+UNSUPPORTED(hexagon_raw10ToRaw8_if)
+UNSUPPORTED(hexagon_rpcMemTest)
+LIFECYCLE(hexagon_setDspPriority)
+LIFECYCLE(hexagon_setDspPriority_if)
+UNSUPPORTED(hexagon_skel_handle_invoke)

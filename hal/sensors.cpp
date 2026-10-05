@@ -85,22 +85,22 @@ static std::string mat4(double yawDeg, double pitchDeg, double x, double y, doub
     return s;
 }
 static std::string cameraJson(uint32_t id) {
-    static const double pose[4][5] = {{30, 25, -0.07, 0.03, -0.01}, {-30, 25, 0.07, 0.03, -0.01}, {30, -25, -0.07, -0.03, -0.01}, {-30, -25, 0.07, -0.03, -0.01}};
+    static const double pose[4][5] = {{10, 10, -0.07, 0.03, -0.01}, {-10, 10, 0.07, 0.03, -0.01}, {10, -10, -0.07, -0.03, -0.01}, {-10, -10, 0.07, -0.03, -0.01}};
     const double* p = pose[id % 4];
     char s[2048];
-    snprintf(s, sizeof s, "{\"CameraCalibration\":{\"Id\":\"%u\",\"SensorType\":\"OV7251\",\"ImageSize\":[640,480],"
-        "\"Projection\":{\"Model\":\"PinholeSymmetric\",\"Coefficients\":[275.0,320.0,240.0]},"
+    snprintf(s, sizeof s, "{\"FileFormat\":{\"Version\":\"0\",\"Timestamp\":\"2022-07-01T09:08:03\",\"UnixTime\":1656666483},\"Device\":{\"SerialNumber\":\"0\",\"DeviceType\":\"Hollywood\",\"BuildType\":\"DVT_A\",\"BuildSubType\":\"\"},\"Metadata\":{\"AlgorithmVersion\":0,\"Source\":\"Factory\",\"Tags\":[],\"NamedTags\":{}},\"CameraCalibration\":[{\"Id\":\"%u\",\"SensorType\":\"OV7251\",\"ImageSize\":[640,480],"
+        "\"Projection\":{\"Model\":\"Pinhole\",\"Coefficients\":[275.0,275.0,320.0,240.0]},"
         "\"Distortion\":{\"Model\":\"KannalaBrandtK3\",\"Coefficients\":[0.03,-0.01,0.0,0.0]},"
-        "\"DeviceFromCamera\":%s,\"Shutter\":{\"Type\":\"Global\"},\"HorizontalFlip\":false,\"VerticalFlip\":false},"
+        "\"DeviceFromCamera\":%s,\"Shutter\":{\"Type\":\"Global\"},\"HorizontalFlip\":false,\"VerticalFlip\":false}],"
         "\"Id\":\"%u\",\"SensorType\":\"OV7251\"}", id, mat4(p[0], p[1], p[2], p[3], p[4]).c_str(), id);
     return s;
 }
 static std::string imuJson() {
-    return "{\"ImuCalibration\":{\"Id\":\"0\",\"SensorType\":\"IMU\",\"DeviceFromImu\":[1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1],"
-           "\"Accelerometer\":{\"Model\":\"UpperTriagonalLinear\",\"RectificationMatrix\":[1,0,0,0,1,0,0,0,1],\"Offset\":{\"Model\":\"Constant\",\"ConstantOffset\":[0,0,0]},\"DtAccelRef\":0.0},"
-           "\"Gyroscope\":{\"Model\":\"LinearGSensitivity\",\"RectificationMatrix\":[1,0,0,0,1,0,0,0,1],\"GSensitivityMatrix\":[0,0,0,0,0,0,0,0,0],\"Offset\":{\"Model\":\"Constant\",\"ConstantOffset\":[0,0,0]},\"DtGyroRef\":0.0}},"
-           "\"Id\":\"0\",\"SensorType\":\"IMU\"}";
+    // The firmware's calibration reader requires the document envelope and the
+    // legacy "Linear" model names (the C++ model type names are not JSON names).
+    return R"json({"FileFormat":{"Version":"0","Timestamp":"2022-07-01T09:08:03","UnixTime":1656666483},"Device":{"SerialNumber":"0","DeviceType":"Hollywood","BuildType":"DVT_A","BuildSubType":""},"Metadata":{"AlgorithmVersion":0,"Source":"Factory","Tags":[],"NamedTags":{}},"ImuCalibration":{"Id":"imu0","SensorType":"ICM42686","DeviceFromImu":[1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1],"Accelerometer":{"Model":"Linear","RectificationMatrix":[1,0,0,0,1,0,0,0,1],"Offset":{"Model":"Constant","ConstantOffset":[0,0,0]},"DtAccelRef":0},"Gyroscope":{"Model":"Linear","RectificationMatrix":[1,0,0,0,1,0,0,0,1],"Offset":{"Model":"Constant","ConstantOffset":[0,0,0]},"DtGyroRef":0}}})json";
 }
+
 static int ashmemWith(const std::string& s) {
     int fd = ashmem_create_region("macvr-calibration", s.size() + 1);
     if (fd < 0) return -1;
@@ -150,7 +150,7 @@ struct Camera : ICameraProvider {
     // the four tracking cameras (ids 0-3); no images ever arrive
     Return<void> getProperties(getProperties_cb cb) override { ALOGI("sensors: camera.%s from pid %d", "getProperties", ::android::hardware::IPCThreadState::self()->getCallingPid());
         hidl_vec<CameraProperties> v; v.resize(4);
-        for (uint32_t i = 0; i < 4; i++) { v[i].id = i; v[i].a = "worldTracking"; v[i].b = "iot"; }
+        for (uint32_t i = 0; i < 4; i++) { v[i].id = i; v[i].a = "OV7251"; v[i].b = "iot"; }
         cb(Result::OK, v); return {}; }
     // a handle with two ashmem regions, factory then online calibration (libvrsensors-hidlwrapper maps both)
     Return<void> getCalibrationData(uint32_t id, getCalibrationData_cb cb) override {
@@ -228,7 +228,9 @@ template <typename Base, typename Data> struct Motion : Base {
     // MotionSensorProperties: four strings (name, ?, factory calibration, online calibration), then plain data
     Return<void> getProperties(typename Base::getProperties_cb cb) override {
         Zero<0, 16, 32, 48> z; auto* str = reinterpret_cast<hidl_string*>(z.b);
-        str[0] = "imu0"; str[2] = imuJson(); str[3] = imuJson();
+        str[0] = "ICM42686"; str[2] = imuJson(); str[3] = imuJson();
+        // MotionSensorProperties nominalRateHz is a float at offset 0x40.
+        *reinterpret_cast<float*>(z.b + 0x40) = 800.0f;
         cb(Result::OK, z.template as<MotionSensorProperties>()); return {}; }
     Return<Result> prepareStream(const MQ<Data>&, const sp<ISensorClient>&, const FmqConfig&) override { return Result::OK; }
     Return<Result> streamControl(const sp<ISensorClient>&, StreamCommand) override { return Result::OK; }

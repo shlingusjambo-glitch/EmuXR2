@@ -24,3 +24,12 @@ put emu/emu_vendor.img work/init.ranchu.rc /etc/init/hw/init.ranchu.rc
 mkdir -p work/macvr && python3 "$H/hal/muxconfig.py" fs/vendor/etc/cameramuxmode/configv2.json > work/macvr/muxmode.txt
 $D -w -R "mkdir /etc/macvr" emu/emu_vendor.img >/dev/null 2>&1 || true
 put emu/emu_vendor.img work/macvr/muxmode.txt /etc/macvr/muxmode.txt u:object_r:vendor_configs_file:s0
+# Desktop tracking: scoped identity, DSP startup adapter, CPU sets and stationary pose input.
+put work/system.img "$H/hal/out/libdeviceid_macvr.so" /system/lib64/libdeviceid_macvr.so
+$D -w -R "mkdir /system/lib64/macvr" work/system.img >/dev/null 2>&1 || true
+put work/system.img "$H/hal/out/libhexagon.so" /system/lib64/macvr/libhexagon.so
+for rc in trackingservice-net mrsystemservice; do x work/system.img /system/etc/init/$rc.rc work/$rc.rc; done
+python3 "$H/compat/install.py" work
+for rc in trackingservice-net mrsystemservice macvr-cpusets; do put work/system.img work/$rc.rc /system/etc/init/$rc.rc; done
+put work/system.img "$H/compat/pose.sh" /system/etc/macvr-pose.sh
+put work/system.img "$H/compat/pose.rc" /system/etc/init/macvr-pose.rc

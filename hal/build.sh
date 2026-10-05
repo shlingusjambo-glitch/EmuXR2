@@ -16,5 +16,12 @@ INC="-nostdinc -isystem $V/external/libcxx/include -isystem $RES/include -isyste
  -I$V/generated-headers/system/libhidl/transport/manager/1.0/android.hidl.manager@1.0_genc++_headers/gen"
 $N/bin/clang++ --target=aarch64-linux-android31 -std=c++17 -O2 -fno-rtti -fPIE -pie -nostdinc++ -nostdlib++ -D__ANDROID_VNDK__ -Wno-unused-parameter $INC \
   -o out/macvr-hal *.cpp -Llib -l:libhidlbase.so -l:libutils.so -l:libcutils.so -l:liblog.so -l:libc++.so -l:libbase.so \
-  -l:vendor.oculus.hardware.graphics.composer@1.0.so -l:vendor.oculus.hardware.graphics.composer@1.1.so -l:vendor.oculus.hardware.sensors_java@1.0.so -l:vendor.oculus.hardware.sensors@1.0.so -Wl,--allow-shlib-undefined
+  -l:vendor.oculus.hardware.graphics.composer@1.0.so -l:vendor.oculus.hardware.graphics.composer@1.1.so -l:vendor.oculus.hardware.sensors_java@1.0.so -l:vendor.oculus.hardware.sensors@1.0.so -l:vendor.oculus.hardware.devicecert@1.0.so -Wl,--allow-shlib-undefined
 ls -la out/macvr-hal
+
+# Scope the Quest identity override to Meta processes using LD_PRELOAD.
+$N/bin/clang++ --target=aarch64-linux-android31 -std=c++17 -O2 -fPIC -shared -nostdinc++ -nostdlib++ $INC \
+  -o out/libdeviceid_macvr.so ../compat/deviceid.cpp -Llib -l:libc++.so -Wl,--allow-shlib-undefined
+
+# DSP startup/memory adapter; compute operations return ENOSYS.
+$N/bin/clang --target=aarch64-linux-android31 -D_GNU_SOURCE -shared -fPIC -O2 ../compat/hexagon.c -llog -o out/libhexagon.so

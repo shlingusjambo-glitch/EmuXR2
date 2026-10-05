@@ -2,7 +2,19 @@
 # rebuild the emulator disk from work/ images and boot it headless; log -> boot.log
 set -e
 H=$(cd "$(dirname "$0")" && pwd); cd ~/MacVRFirmware; S=~/Library/Android/sdk/system-images/android-32/google_apis/arm64-v8a
-pkill -f "qemu-system-aarch64.*horizon" 2>/dev/null || true; sleep 1
+# Wait for the old VM to release its disk and AVD locks before rebuilding.
+pids=$(pgrep -f 'qemu-system-aarch64.*-avd horizon( |$)' || true)
+if [ -n "$pids" ]; then
+    kill $pids 2>/dev/null || true
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        alive=0
+        for pid in $pids; do kill -0 "$pid" 2>/dev/null && alive=1; done
+        [ "$alive" = 0 ] && break
+        sleep 1
+    done
+    for pid in $pids; do kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true; done
+    sleep 1
+fi
 rm -f sysdir/system.img
 python3 "$H/build_super.py" $S/system.img sysdir/system.img system=work/system.img system_ext=work/system_ext.img product=work/product.img vendor=emu/emu_vendor.img >/dev/null
 python3 - <<'PY'
@@ -13,5 +25,8 @@ f.seek(2048 * 512); f.write(v); f.close(); t = open(p + 'VerifiedBootParams.text
 open(p + 'VerifiedBootParams.textproto', 'w').write(re.sub(r'digest=[0-9a-f]+', 'digest=' + hashlib.sha256(v).hexdigest(), t))
 PY
 export ANDROID_SDK_ROOT=~/Library/Android/sdk
-nohup ~/Library/Android/sdk/emulator/emulator -avd horizon -sysdir ~/MacVRFirmware/sysdir -no-snapshot -no-boot-anim ${WIPE--wipe-data} -show-kernel ${WINDOW--no-window} -gpu host -logcat "*:I" -logcat-output ~/MacVRFirmware/logcat.txt $EMUARGS > boot.log 2>&1 &
+if [ "${FOREGROUND:-0}" = 1 ]; then
+    exec ~/Library/Android/sdk/emulator/emulator -avd horizon -sysdir ~/MacVRFirmware/sysdir -no-snapshot -no-boot-anim ${WIPE-} ${WINDOW--no-window} -gpu ${GPU-swiftshader} -no-metrics -crash-report-mode never -logcat "*:I" -logcat-output ~/MacVRFirmware/logcat.txt $EMUARGS
+fi
+nohup ~/Library/Android/sdk/emulator/emulator -avd horizon -sysdir ~/MacVRFirmware/sysdir -no-snapshot -no-boot-anim ${WIPE-} -show-kernel ${WINDOW--no-window} -gpu ${GPU-swiftshader} -no-metrics -crash-report-mode never -logcat "*:I" -logcat-output ~/MacVRFirmware/logcat.txt $EMUARGS > boot.log 2>&1 &
 echo booting
