@@ -51,7 +51,7 @@ typedef struct {
     FN(CreateFence); FN(DestroyFence); FN(WaitForFences);
     FN(CreateImageView); FN(DestroyImageView); FN(CreateFramebuffer); FN(DestroyFramebuffer);
     FN(CmdBeginRenderPass); FN(CmdBeginRenderPass2); FN(CmdBeginRenderPass2KHR);
-    FN(CmdClearColorImage); FN(CmdBeginRendering); FN(CmdBeginRenderingKHR); FN(CmdPipelineBarrier2); FN(CmdPipelineBarrier2KHR); FN(CmdExecuteCommands); FN(CmdCopyImage2); FN(CmdBlitImage2); FN(CmdResolveImage2); FN(CmdCopyBufferToImage2); FN(CmdCopyImage2KHR); FN(CmdBlitImage2KHR); FN(CmdResolveImage2KHR); FN(CmdCopyBufferToImage2KHR); FN(CreateRenderPass); FN(CreateRenderPass2); FN(CmdNextSubpass); FN(CmdEndRenderPass); FN(CmdBlitImage); FN(CmdCopyBufferToImage); FN(CmdResolveImage);
+    FN(CmdClearColorImage); FN(CmdBeginRendering); FN(CmdBeginRenderingKHR); FN(CmdPipelineBarrier2); FN(CmdPipelineBarrier2KHR); FN(CmdExecuteCommands); FN(CmdDraw); FN(CmdDrawIndexed); FN(CmdCopyImage2); FN(CmdBlitImage2); FN(CmdResolveImage2); FN(CmdCopyBufferToImage2); FN(CmdCopyImage2KHR); FN(CmdBlitImage2KHR); FN(CmdResolveImage2KHR); FN(CmdCopyBufferToImage2KHR); FN(CreateRenderPass); FN(CreateRenderPass2); FN(CmdNextSubpass); FN(CmdEndRenderPass); FN(CmdBlitImage); FN(CmdCopyBufferToImage); FN(CmdResolveImage);
     VkCommandPool pool[8];   // per queue family, for our copy command buffers
     VkImage lastExt;         // external image whose requirements were queried last
 } Dev;
@@ -324,7 +324,7 @@ static VkResult CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, 
         GET(CreateFence); GET(DestroyFence); GET(WaitForFences);
         GET(CreateImageView); GET(DestroyImageView); GET(CreateFramebuffer); GET(DestroyFramebuffer);
         GET(CmdBeginRenderPass); GET(CmdBeginRenderPass2); GET(CmdBeginRenderPass2KHR);
-        GET(CmdClearColorImage); GET(CmdBeginRendering); GET(CmdBeginRenderingKHR); GET(CmdPipelineBarrier2); GET(CmdPipelineBarrier2KHR); GET(CmdExecuteCommands); GET(CmdCopyImage2); GET(CmdBlitImage2); GET(CmdResolveImage2); GET(CmdCopyBufferToImage2); GET(CmdCopyImage2KHR); GET(CmdBlitImage2KHR); GET(CmdResolveImage2KHR); GET(CmdCopyBufferToImage2KHR); GET(CreateRenderPass); GET(CreateRenderPass2); GET(CmdNextSubpass); GET(CmdEndRenderPass); GET(CmdBlitImage); GET(CmdCopyBufferToImage); GET(CmdResolveImage);
+        GET(CmdClearColorImage); GET(CmdBeginRendering); GET(CmdBeginRenderingKHR); GET(CmdPipelineBarrier2); GET(CmdPipelineBarrier2KHR); GET(CmdExecuteCommands); GET(CmdDraw); GET(CmdDrawIndexed); GET(CmdCopyImage2); GET(CmdBlitImage2); GET(CmdResolveImage2); GET(CmdCopyBufferToImage2); GET(CmdCopyImage2KHR); GET(CmdBlitImage2KHR); GET(CmdResolveImage2KHR); GET(CmdCopyBufferToImage2KHR); GET(CreateRenderPass); GET(CreateRenderPass2); GET(CmdNextSubpass); GET(CmdEndRenderPass); GET(CmdBlitImage); GET(CmdCopyBufferToImage); GET(CmdResolveImage);
     }
     if (!worker) pthread_create(&worker, NULL, workerMain, NULL);
     pthread_mutex_unlock(&lock);
@@ -383,11 +383,89 @@ static VkResult GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice pd, con
 }
 
 // ---- device level ----
+// ---- multisampled eye targets ----
+// Meta's Clay engine (ShellEnv) renders its eyes into a transient 4x multisampled target and records no resolve into
+// the swapchain: on the Quest's tile GPU the multisampled data never leaves tile memory and lands in the swapchain
+// on its own. On a desktop GPU nothing does that, so the target becomes a transfer source and, after each submit that
+// rendered it, is resolved into the app's swapchain images of the same size, layers and format (which then go to the
+// compositor like any other write).
+typedef struct { VkImage im; VkDevice dev; VkExtent3D e; uint32_t layers; VkFormat fmt; VkCommandBuffer cb; uint32_t family; Shared *tgt[8]; int nt; } Msaa;
+static Msaa msaa[16];
+static struct { VkFramebuffer fb; Msaa *m; } fbMsaa[64];
+static struct { VkCommandBuffer cb; Msaa *m; } cbMsaa[256];
+static struct { VkImageView v; VkImage im; } viewImg[1024];
+static Msaa *msaaOf(VkImage im) { for (int i = 0; i < 16; i++) if (im && msaa[i].im == im) return &msaa[i]; return NULL; }
+static Msaa *cbMsaaGet(VkCommandBuffer cb) { for (int i = 0; i < 256; i++) if (cbMsaa[i].cb == cb) return cbMsaa[i].m; return NULL; }
+static void cbMsaaSet(VkCommandBuffer cb, Msaa *m) {
+    int f = -1; for (int i = 0; i < 256; i++) { if (cbMsaa[i].cb == cb) { cbMsaa[i].m = m; return; } if (f < 0 && !cbMsaa[i].cb) f = i; }
+    if (f >= 0 && m) { cbMsaa[f].cb = cb; cbMsaa[f].m = m; }
+}
+// the resolve for one target set (rebuilt when the swapchain images change); call with the lock held
+static VkCommandBuffer resolveCmd(Dev *d, Msaa *m, uint32_t family) {
+    Shared *t[8]; int nt = 0;
+    for (int i = 0; i < MAXSHARED && nt < 8; i++) {
+        Shared *s = shared[i];
+        if (s && s->dev == m->dev && s->complex && s->ready && s->ci.samples == VK_SAMPLE_COUNT_1_BIT && s->ci.format == m->fmt
+            && s->ci.extent.width == m->e.width && s->ci.extent.height == m->e.height && s->ci.arrayLayers == m->layers) t[nt++] = s;
+    }
+    if (!nt) return VK_NULL_HANDLE;
+    if (m->cb && m->family == family && m->nt == nt && !memcmp(m->tgt, t, nt * sizeof *t)) return m->cb;
+    if (m->cb) d->FreeCommandBuffers(m->dev, d->pool[m->family], 1, &m->cb), m->cb = VK_NULL_HANDLE;
+    if (family >= 8) return VK_NULL_HANDLE;
+    if (!d->pool[family]) {
+        VkCommandPoolCreateInfo pi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, family};
+        if (d->CreateCommandPool(m->dev, &pi, NULL, &d->pool[family])) return VK_NULL_HANDLE;
+    }
+    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, d->pool[family], VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+    VkCommandBuffer cb;
+    if (d->AllocateCommandBuffers(m->dev, &ai, &cb)) return VK_NULL_HANDLE;
+    *(void **)cb = *(void **)m->dev;
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT};
+    d->BeginCommandBuffer(cb, &bi);
+    VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, m->layers};
+    VkImageMemoryBarrier toSrc = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, m->im, all};
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 1, &toSrc);
+    VkImageResolve r = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, m->layers}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, m->layers}, {0, 0, 0}, {m->e.width, m->e.height, 1}};
+    for (int i = 0; i < nt; i++) d->CmdResolveImage(cb, m->im, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t[i]->image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    VkImageMemoryBarrier back = toSrc;
+    back.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; back.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+    back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; back.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    VkMemoryBarrier mb2 = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_MEMORY_READ_BIT};
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb2, 0, NULL, 1, &back);
+    d->EndCommandBuffer(cb);
+    m->cb = cb; m->family = family; m->nt = nt; memcpy(m->tgt, t, nt * sizeof *t);
+    LOG("resolving a %ux%u x%u multisampled target into %d swapchain images", m->e.width, m->e.height, m->layers, nt);
+    return cb;
+}
+
 static VkResult CreateImage(VkDevice dev, const VkImageCreateInfo *ci, const VkAllocationCallbacks *a, VkImage *out) {
     Dev *d = findDev(dev);
     const VkExternalMemoryImageCreateInfo *e = (const void *)find(ci->pNext, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
+    if (!e && ci->samples != VK_SAMPLE_COUNT_1_BIT && (ci->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && ci->imageType == VK_IMAGE_TYPE_2D && ci->mipLevels == 1) {
+        VkImageCreateInfo c = *ci;
+        c.usage = (c.usage & ~VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        VkResult r = d->CreateImage(dev, &c, a, out);
+        if (!r) {
+            pthread_mutex_lock(&lock);
+            for (int i = 0; i < 16; i++) if (!msaa[i].im) { memset(&msaa[i], 0, sizeof msaa[i]); msaa[i].im = *out; msaa[i].dev = dev; msaa[i].e = ci->extent; msaa[i].layers = ci->arrayLayers; msaa[i].fmt = ci->format; break; }
+            pthread_mutex_unlock(&lock);
+        }
+        return r;
+    }
     if (e && (e->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID)) {
         static unsigned n; if (n++ < 20) LOG("AHB image %ux%u x%u layers usage 0x%x", ci->extent.width, ci->extent.height, ci->arrayLayers, ci->usage); }
+    if (ci->arrayLayers == 2 && (!e || !(e->handleTypes & OPAQUE))) {
+        VkResult rr = d->CreateImage(dev, ci, a, out);
+        static unsigned n; if (n++ < 20) LOG("plain image %p %ux%u x%u layers mips %u samples %u fmt %d usage 0x%x flags 0x%x ext 0x%x pnext %d", (void *)*out, ci->extent.width, ci->extent.height, ci->arrayLayers, ci->mipLevels, ci->samples, ci->format, ci->usage, ci->flags, e ? e->handleTypes : 0, ci->pNext ? ((const VkBaseInStructure *)ci->pNext)->sType : 0);
+        return rr;
+    }
+    if (0) {
+        VkResult rr = d->CreateImage(dev, ci, a, out);
+        static unsigned n; if (n++ < 20) LOG("plain image %p %ux%u x%u layers mips %u samples %u fmt %d usage 0x%x flags 0x%x ext 0x%x", (void *)*out, ci->extent.width, ci->extent.height, ci->arrayLayers, ci->mipLevels, ci->samples, ci->format, ci->usage, ci->flags, e ? e->handleTypes : 0);
+        return rr;
+    }
     if (!e || !(e->handleTypes & OPAQUE)) return d->CreateImage(dev, ci, a, out);
     // Native Android buffers cannot carry storage-image usage on the Mac host driver.
     int complex = (ci->usage & VK_IMAGE_USAGE_STORAGE_BIT) || ci->arrayLayers > 1 || ci->mipLevels > 1 || ci->imageType != VK_IMAGE_TYPE_2D || ci->samples != VK_SAMPLE_COUNT_1_BIT
@@ -417,6 +495,9 @@ static VkResult CreateImage(VkDevice dev, const VkImageCreateInfo *ci, const VkA
 }
 
 static void DestroyImage(VkDevice dev, VkImage im, const VkAllocationCallbacks *a) {
+    { Dev *dd = findDev(dev); pthread_mutex_lock(&lock); Msaa *m = msaaOf(im);
+      if (m) { if (m->cb) dd->FreeCommandBuffers(dev, dd->pool[m->family], 1, &m->cb); memset(m, 0, sizeof *m); }
+      pthread_mutex_unlock(&lock); }
     Dev *d = findDev(dev);
     pthread_mutex_lock(&lock); Shared *s = byImage(im); pthread_mutex_unlock(&lock);
     if (s) { if (d->lastExt == im) d->lastExt = VK_NULL_HANDLE; freeShared(s); }
@@ -579,6 +660,7 @@ static VkResult GetMemoryFdPropertiesKHR(VkDevice dev, VkExternalMemoryHandleTyp
 }
 
 static void bindPending(VkDevice dev, VkImage image, VkDeviceMemory mem) {
+    { Shared *m = byMem(mem); if (m && m->image != image) { static unsigned n; if (n++ < 20) LOG("alias: image %p bound to the memory of shared %ux%u x%u (%p)", (void *)image, m->ci.extent.width, m->ci.extent.height, m->ci.arrayLayers, (void *)m->image); } }
     pthread_mutex_lock(&lock);
     Pending *p = NULL;
     for (int k = 0; k < 64; k++) if (pending[k].mem == mem && pending[k].dev == dev) p = &pending[k];
@@ -612,9 +694,13 @@ static VkResult BindImageMemory2(VkDevice dev, uint32_t n, const VkBindImageMemo
 }
 
 // ---- write tracking ----
+static struct { VkImageView v; VkImage im; uint32_t base, count; VkImageViewType t; } dbgViews[512]; static unsigned dbgViewN;
+static struct { VkImage im; VkExtent3D e; uint32_t layers, usage, ext; } dbgImgs[512]; static unsigned dbgImgN;
 static VkResult CreateImageView(VkDevice dev, const VkImageViewCreateInfo *ci, const VkAllocationCallbacks *a, VkImageView *out) {
     Dev *d = findDev(dev);
     VkResult r = d->CreateImageView(dev, ci, a, out);
+    if (!r && msaaOf(ci->image)) { pthread_mutex_lock(&lock); for (int i = 0; i < 1024; i++) if (!viewImg[i].v || viewImg[i].v == *out) { viewImg[i].v = *out; viewImg[i].im = ci->image; break; } pthread_mutex_unlock(&lock); }
+    if (!r) { unsigned k = __atomic_fetch_add(&dbgViewN, 1, __ATOMIC_RELAXED) % 512; dbgViews[k].v = *out; dbgViews[k].im = ci->image; dbgViews[k].base = ci->subresourceRange.baseArrayLayer; dbgViews[k].count = ci->subresourceRange.layerCount; dbgViews[k].t = ci->viewType; }
     pthread_mutex_lock(&lock);
     Shared *s = byImage(ci->image);
     if (!r && s && s->complex) { Track *t = slot(views, 256, (void *)*out, 1); if (!t) LOG("view table full"); addTo(t, s); }
@@ -631,9 +717,21 @@ static void DestroyImageView(VkDevice dev, VkImageView v, const VkAllocationCall
 static VkResult CreateFramebuffer(VkDevice dev, const VkFramebufferCreateInfo *ci, const VkAllocationCallbacks *a, VkFramebuffer *out) {
     Dev *d = findDev(dev);
     VkResult r = d->CreateFramebuffer(dev, ci, a, out);
+    if (!r && ci->pAttachments) {
+        pthread_mutex_lock(&lock);
+        Msaa *m = NULL;
+        for (uint32_t i = 0; i < ci->attachmentCount && !m; i++) for (int k = 0; k < 1024; k++) if (viewImg[k].v == ci->pAttachments[i]) { m = msaaOf(viewImg[k].im); break; }
+        if (m) for (int i = 0; i < 64; i++) if (!fbMsaa[i].fb || fbMsaa[i].fb == *out) { fbMsaa[i].fb = *out; fbMsaa[i].m = m; break; }
+        pthread_mutex_unlock(&lock);
+    }
+    if (r) LOG("vkCreateFramebuffer %ux%u (%u attachments) failed %d", ci->width, ci->height, ci->attachmentCount, r);
     if (ci->width == 1440) { static unsigned n; if (n++ < 10) {
         char b[256] = {0}; int o = 0;
-        for (uint32_t i = 0; i < ci->attachmentCount && ci->pAttachments && o < 200; i++) { Track *v = slot(views, 256, (void *)ci->pAttachments[i], 0); o += snprintf(b + o, sizeof b - o, " %p:%d", (void *)ci->pAttachments[i], v && v->s[0]); }
+        for (uint32_t i = 0; i < ci->attachmentCount && ci->pAttachments && o < 200; i++) {
+            Track *v = slot(views, 256, (void *)ci->pAttachments[i], 0); VkImage im = 0; uint32_t bl = 0, lc = 0;
+            for (unsigned k = 0; k < 512; k++) if (dbgViews[k].v == ci->pAttachments[i]) { im = dbgViews[k].im; bl = dbgViews[k].base; lc = dbgViews[k].count; }
+            Shared *sh = byImage(im); Shared *sm = NULL;
+            o += snprintf(b + o, sizeof b - o, " [view %p img %p layers %u+%u shared %d]", (void *)ci->pAttachments[i], (void *)im, bl, lc, sh != NULL); (void)v; (void)sm; }
         LOG("framebuffer %ux%ux%u flags 0x%x attachments %u%s", ci->width, ci->height, ci->layers, ci->flags, ci->attachmentCount, b); } }
     pthread_mutex_lock(&lock);
     if (!r && ci->pAttachments)
@@ -657,6 +755,7 @@ static Dev *cbDev(VkCommandBuffer cb) {
 }
 static void markPass(VkCommandBuffer cb, const VkRenderPassBeginInfo *bi) {
     pthread_mutex_lock(&lock);
+    for (int i = 0; i < 64; i++) if (fbMsaa[i].fb && fbMsaa[i].fb == bi->framebuffer) { cbMsaaSet(cb, fbMsaa[i].m); break; }
     Track *f = slot(fbs, 256, (void *)bi->framebuffer, 0);
     Shared *list[16]; int n = 0;
     if (f) for (int k = 0; k < 8; k++) if (f->s[k]) list[n++] = f->s[k];
@@ -711,17 +810,20 @@ static void CmdPipelineBarrier2(VkCommandBuffer cb, const VkDependencyInfo *di) 
     }
     Dev *d = cbDev(cb); (d->CmdPipelineBarrier2 ? d->CmdPipelineBarrier2 : d->CmdPipelineBarrier2KHR)(cb, di);
 }
+static unsigned draws;   // debug
+static void CmdDraw(VkCommandBuffer cb, uint32_t a, uint32_t b, uint32_t c, uint32_t d) { if (__atomic_add_fetch(&draws, 1, __ATOMIC_RELAXED) % 2000 == 1) LOG("draws: %u", draws); cbDev(cb)->CmdDraw(cb, a, b, c, d); }
+static void CmdDrawIndexed(VkCommandBuffer cb, uint32_t a, uint32_t b, uint32_t c, int32_t d, uint32_t e) { if (__atomic_add_fetch(&draws, 1, __ATOMIC_RELAXED) % 2000 == 1) LOG("draws: %u", draws); cbDev(cb)->CmdDrawIndexed(cb, a, b, c, d, e); }
 // secondary command buffers: what they write, the primary that runs them writes
 static void CmdExecuteCommands(VkCommandBuffer cb, uint32_t n, const VkCommandBuffer *sec) {
     Shared *list[64]; int k = 0;
     pthread_mutex_lock(&lock);
-    for (uint32_t i = 0; i < n; i++) { Track *t = slot(cbs, MAXT, sec[i], 0); if (t) for (int j = 0; j < 8 && k < 64; j++) if (t->s[j]) list[k++] = t->s[j]; }
+    for (uint32_t i = 0; i < n; i++) { Track *t = slot(cbs, MAXT, sec[i], 0); if (t) for (int j = 0; j < 8 && k < 64; j++) if (t->s[j]) list[k++] = t->s[j]; Msaa *m = cbMsaaGet(sec[i]); if (m) cbMsaaSet(cb, m); }
     pthread_mutex_unlock(&lock);
     for (int i = 0; i < k; i++) markCb(cb, list[i]);
     cbDev(cb)->CmdExecuteCommands(cb, n, sec);
 }
 // the Vulkan 1.3 forms of the transfer commands
-#define V2(name, Info, dstField) static void name(VkCommandBuffer cb, const Info *i) { markCb(cb, byImage(i->dstField)); Dev *d = cbDev(cb); (d->name ? d->name : d->name##KHR)(cb, i); }
+#define V2(name, Info, dstField) static void name(VkCommandBuffer cb, const Info *i) { { static unsigned k; if (k++ < 10) LOG(#name " -> %p (shared %d)", (void *)i->dstField, byImage(i->dstField) != NULL); } markCb(cb, byImage(i->dstField)); Dev *d = cbDev(cb); (d->name ? d->name : d->name##KHR)(cb, i); }
 V2(CmdCopyImage2, VkCopyImageInfo2, dstImage)
 V2(CmdBlitImage2, VkBlitImageInfo2, dstImage)
 V2(CmdResolveImage2, VkResolveImageInfo2, dstImage)
@@ -730,25 +832,45 @@ static void CmdClearColorImage(VkCommandBuffer cb, VkImage im, VkImageLayout l, 
     markCb(cb, byImage(im)); cbDev(cb)->CmdClearColorImage(cb, im, l, c, n, r);
 }
 static void CmdBlitImage(VkCommandBuffer cb, VkImage s, VkImageLayout sl, VkImage dst, VkImageLayout dl, uint32_t n, const VkImageBlit *r, VkFilter f) {
+    { static unsigned k; if (k++ < 10) LOG("blit %p -> %p (shared %d)", (void *)s, (void *)dst, byImage(dst) != NULL); }
     markCb(cb, byImage(dst)); cbDev(cb)->CmdBlitImage(cb, s, sl, dst, dl, n, r, f);
 }
 static void CmdCopyImage(VkCommandBuffer cb, VkImage s, VkImageLayout sl, VkImage dst, VkImageLayout dl, uint32_t n, const VkImageCopy *r) {
+    { static unsigned k; if (k++ < 10) LOG("copy %p -> %p (shared %d)", (void *)s, (void *)dst, byImage(dst) != NULL); }
     markCb(cb, byImage(dst)); cbDev(cb)->CmdCopyImage(cb, s, sl, dst, dl, n, r);
 }
 static void CmdCopyBufferToImage(VkCommandBuffer cb, VkBuffer b, VkImage dst, VkImageLayout dl, uint32_t n, const VkBufferImageCopy *r) {
     markCb(cb, byImage(dst)); cbDev(cb)->CmdCopyBufferToImage(cb, b, dst, dl, n, r);
 }
 static void CmdResolveImage(VkCommandBuffer cb, VkImage s, VkImageLayout sl, VkImage dst, VkImageLayout dl, uint32_t n, const VkImageResolve *r) {
+    { static unsigned k; if (k++ < 10) LOG("resolve %p -> %p (shared %d)", (void *)s, (void *)dst, byImage(dst) != NULL); }
     markCb(cb, byImage(dst)); cbDev(cb)->CmdResolveImage(cb, s, sl, dst, dl, n, r);
 }
 static VkResult BeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo *bi) {
-    pthread_mutex_lock(&lock); Track *t = slot(cbs, MAXT, cb, 0); if (t) memset(t->s, 0, sizeof t->s); pthread_mutex_unlock(&lock);
+    pthread_mutex_lock(&lock); Track *t = slot(cbs, MAXT, cb, 0); if (t) memset(t->s, 0, sizeof t->s); cbMsaaSet(cb, NULL); pthread_mutex_unlock(&lock);
     return cbDev(cb)->BeginCommandBuffer(cb, bi);
 }
 
+static VkResult CreateRenderPass(VkDevice dev, const VkRenderPassCreateInfo *ci, const VkAllocationCallbacks *a, VkRenderPass *out) {
+    { static unsigned n; if (n++ < 30) {
+        char b[300] = {0}; int o = 0;
+        for (uint32_t i = 0; i < ci->attachmentCount && o < 250; i++) o += snprintf(b + o, sizeof b - o, " a%u:fmt%d/s%d/ld%d/st%d/%d->%d", i, ci->pAttachments[i].format, ci->pAttachments[i].samples, ci->pAttachments[i].loadOp, ci->pAttachments[i].storeOp, ci->pAttachments[i].initialLayout, ci->pAttachments[i].finalLayout);
+        LOG("renderpass %u att%s, %u subpasses (sp0 color %u input %u), resolve %d, pNext %d, sp0 pNext %d", ci->attachmentCount, b, ci->subpassCount, ci->pSubpasses[0].colorAttachmentCount, ci->pSubpasses[0].inputAttachmentCount,
+            ci->pSubpasses[0].pResolveAttachments ? (int)ci->pSubpasses[0].pResolveAttachments[0].attachment : -1, ci->pNext ? ((const VkBaseInStructure *)ci->pNext)->sType : 0, 0); } }
+    VkResult r = findDev(dev)->CreateRenderPass(dev, ci, a, out);
+    if (r) LOG("vkCreateRenderPass (%u attachments, pNext %d) failed %d", ci->attachmentCount, ci->pNext ? ((const VkBaseInStructure *)ci->pNext)->sType : 0, r);
+    return r;
+}
 // ---- VK_KHR_create_renderpass2 over render pass v1 (the emulator's driver has only v1) ----
 static VkResult CreateRenderPass2(VkDevice dev, const VkRenderPassCreateInfo2 *ci, const VkAllocationCallbacks *a, VkRenderPass *out) {
     Dev *d = findDev(dev);
+    { static unsigned n; if (n++ < 30) {
+        char b[300] = {0}; int o = 0;
+        for (uint32_t i = 0; i < ci->attachmentCount && o < 250; i++) o += snprintf(b + o, sizeof b - o, " a%u:fmt%d/s%d/ld%d/st%d", i, ci->pAttachments[i].format, ci->pAttachments[i].samples, ci->pAttachments[i].loadOp, ci->pAttachments[i].storeOp);
+        const VkSubpassDescription2 *sp = &ci->pSubpasses[0];
+        LOG("renderpass2 %u att%s | subpass0 color %u resolve %d depthResolve %d viewMask 0x%x pNext %d", ci->attachmentCount, b, sp->colorAttachmentCount,
+            sp->pResolveAttachments ? (int)sp->pResolveAttachments[0].attachment : -1,
+            find(sp->pNext, VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE) != NULL, sp->viewMask, ci->pNext ? ((const VkBaseInStructure *)ci->pNext)->sType : 0); } }
     if (d->CreateRenderPass2) return d->CreateRenderPass2(dev, ci, a, out);
     VkAttachmentDescription *att = calloc(ci->attachmentCount + 1, sizeof *att);
     for (uint32_t i = 0; i < ci->attachmentCount; i++) {
@@ -822,6 +944,16 @@ static VkResult QueueSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo *s
                 if (!dup && np < 64) post[np++] = t->s[k];
             }
         }
+    VkCommandBuffer res[8]; int nres = 0;
+    for (uint32_t i = 0; i < count; i++)
+        for (uint32_t c = 0; c < submits[i].commandBufferCount; c++) {
+            Msaa *m = cbMsaaGet(submits[i].pCommandBuffers[c]); VkCommandBuffer rc;
+            if (m && nres < 8 && (rc = resolveCmd(d, m, q->family))) {
+                int dupc = 0; for (int j = 0; j < nres; j++) dupc |= res[j] == rc;
+                if (!dupc) res[nres++] = rc;
+                for (int k = 0; k < m->nt; k++) { int dup = 0; for (int j = 0; j < np; j++) dup |= post[j] == m->tgt[k]; if (!dup && np < 64) post[np++] = m->tgt[k]; }
+            }
+        }
     for (int i = 0; i < MAXSHARED && nr < 64; i++) {
         Shared *s = shared[i];
         if (s && s->dev == d->dev && s->complex && s->ready && s->gen && atomic_load(s->gen) != s->seen) {
@@ -831,7 +963,8 @@ static VkResult QueueSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo *s
     pthread_mutex_unlock(&lock);
     if (!np && !nr) return d->QueueSubmit(queue, count, submits, fence);
 
-    VkCommandBuffer preCb[64], postCb[64]; int a = 0, b = 0;
+    VkCommandBuffer preCb[64], postCb[72]; int a = 0, b = 0;
+    for (int i = 0; i < nres; i++) postCb[b++] = res[i];
     for (int i = 0; i < nr; i++) { VkCommandBuffer c = copyCmd(pre[i], q->family, 1); if (c) preCb[a++] = c; }
     for (int i = 0; i < np; i++) { VkCommandBuffer c = copyCmd(post[i], q->family, 0); if (c) postCb[b++] = c; }
     for (int i = 0; i < np; i++) if (post[i]->ci.arrayLayers > 1) { static unsigned n; if (n++ % 500 == 0) LOG("stereo out #%u: %ux%u", n, post[i]->ci.extent.width, post[i]->ci.extent.height); }
@@ -891,12 +1024,23 @@ static VkResult QueueSubmit2(VkQueue queue, uint32_t count, const VkSubmitInfo2 
                 if (!dup && np < 64) post[np++] = t->s[k];
             }
         }
+    VkCommandBuffer res[8]; int nres = 0;
+    for (uint32_t i = 0; i < count; i++)
+        for (uint32_t c = 0; c < submits[i].commandBufferInfoCount; c++) {
+            Msaa *m = cbMsaaGet(submits[i].pCommandBufferInfos[c].commandBuffer); VkCommandBuffer rc;
+            if (m && nres < 8 && (rc = resolveCmd(d, m, q->family))) {
+                int dupc = 0; for (int j = 0; j < nres; j++) dupc |= res[j] == rc;
+                if (!dupc) res[nres++] = rc;
+                for (int k = 0; k < m->nt; k++) { int dup = 0; for (int j = 0; j < np; j++) dup |= post[j] == m->tgt[k]; if (!dup && np < 64) post[np++] = m->tgt[k]; }
+            }
+        }
     for (int i = 0; i < MAXSHARED && nr < 64; i++) {
         Shared *s = shared[i];
         if (s && s->dev == d->dev && s->complex && s->ready && s->gen && atomic_load(s->gen) != s->seen) { s->seen = atomic_load(s->gen); pre[nr++] = s; }
     }
     pthread_mutex_unlock(&lock);
-    VkCommandBuffer preCb[64], postCb[64]; int a = 0, b = 0;
+    VkCommandBuffer preCb[64], postCb[72]; int a = 0, b = 0;
+    for (int i = 0; i < nres; i++) postCb[b++] = res[i];
     for (int i = 0; i < nr; i++) { VkCommandBuffer c = copyCmd(pre[i], q->family, 1); if (c) preCb[a++] = c; }
     for (int i = 0; i < np; i++) { VkCommandBuffer c = copyCmd(post[i], q->family, 0); if (c) postCb[b++] = c; }
     if (a) { VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = a, .pCommandBuffers = preCb}; d->QueueSubmit(queue, 1, &si, VK_NULL_HANDLE); }
@@ -943,6 +1087,7 @@ static PFN_vkVoidFunction deviceHook(const char *n) {
     HOOK("vkCmdClearColorImage", CmdClearColorImage);
     HOOK("vkCmdBeginRendering", CmdBeginRendering);
     HOOK("vkCmdExecuteCommands", CmdExecuteCommands);
+    HOOK("vkCmdDraw", CmdDraw); HOOK("vkCmdDrawIndexed", CmdDrawIndexed);
     HOOK("vkCmdCopyImage2", CmdCopyImage2); HOOK("vkCmdCopyImage2KHR", CmdCopyImage2);
     HOOK("vkCmdBlitImage2", CmdBlitImage2); HOOK("vkCmdBlitImage2KHR", CmdBlitImage2);
     HOOK("vkCmdResolveImage2", CmdResolveImage2); HOOK("vkCmdResolveImage2KHR", CmdResolveImage2);
@@ -961,6 +1106,7 @@ static PFN_vkVoidFunction deviceHook(const char *n) {
     HOOK("vkQueueSubmit", QueueSubmit);
     HOOK("vkQueueSubmit2", QueueSubmit2);
     HOOK("vkQueueSubmit2KHR", QueueSubmit2);
+    HOOK("vkCreateRenderPass", CreateRenderPass);
     HOOK("vkCreateRenderPass2", CreateRenderPass2);
     HOOK("vkCreateRenderPass2KHR", CreateRenderPass2);
     HOOK("vkCmdNextSubpass2", CmdNextSubpass2);
@@ -971,6 +1117,7 @@ static PFN_vkVoidFunction deviceHook(const char *n) {
 }
 static PFN_vkVoidFunction GetDeviceProcAddr(VkDevice dev, const char *n) {
     if (!realGDPA) realGDPA = (PFN_vkGetDeviceProcAddr)IPA("vkGetDeviceProcAddr");
+    if (!strncmp(n, "vkCmd", 5)) { static unsigned k; if (k++ < 400) LOG("gdpa %s", n); }
     PFN_vkVoidFunction h = deviceHook(n);
     return h ? h : realGDPA(dev, n);
 }
