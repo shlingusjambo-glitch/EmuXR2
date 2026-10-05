@@ -25,3 +25,4 @@ $N/bin/clang++ --target=aarch64-linux-android31 -std=c++17 -O2 -fPIC -shared -no
 
 # DSP startup/memory adapter; compute operations return ENOSYS.
 $N/bin/clang --target=aarch64-linux-android31 -D_GNU_SOURCE -shared -fPIC -O2 ../compat/hexagon.c -llog -o out/libhexagon.so
+

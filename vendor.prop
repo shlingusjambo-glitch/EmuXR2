@@ -1,3 +1,5 @@
 
 # macvr
 ro.surface_flinger.has_writeback_dpu_cac=false
+# skip Meta first-time setup (it pairs with a phone, which an emulator cannot do)
+debug.nux.disable_automatic_startup=1

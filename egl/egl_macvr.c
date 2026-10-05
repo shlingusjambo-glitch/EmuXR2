@@ -8,6 +8,7 @@
 #include <android/log.h>
 #include <dlfcn.h>
 #include <string.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
 #include <unistd.h>
@@ -72,6 +73,7 @@ EGLSurface eglCreatePbufferSurface(EGLDisplay d, EGLConfig c, const EGLint *attr
 // draws straight into the front buffer, which its display scans out; on the emulator the buffer goes through
 // SurfaceFlinger, which has to be told to show it again every vsync
 static struct { EGLSurface s; EGLNativeWindowType w; int front; } wins[32];
+static void hookRuntime(void);
 static int isCompositor(void) {
     static int v = -1;
     if (v < 0) { char n[64] = {0}; FILE *f = fopen("/proc/self/cmdline", "r"); if (f) { fread(n, 1, 63, f); fclose(f); } v = !strcmp(n, "com.oculus.vrruntimeservice"); }
@@ -102,6 +104,7 @@ EGLSurface eglCreateWindowSurface(EGLDisplay d, EGLConfig c, EGLNativeWindowType
         if (attr[i] == EGL_RENDER_BUFFER && attr[i + 1] == EGL_SINGLE_BUFFER) frontBuffer(s);
     LOG("eglCreateWindowSurface(%p) -> %p (compositor %d)", w, s, isCompositor());
     if (s != EGL_NO_SURFACE && isCompositor()) {
+        hookRuntime();
         // Meta's compositor swaps once, then keeps drawing into that buffer, which the Quest's display scans out.
         // Here the surface keeps its contents across swaps, and is presented at the compositor's fences (see present).
         EGLBoolean ok = ((EGLBoolean (*)(EGLDisplay, EGLSurface, EGLint, EGLint))real("eglSurfaceAttrib"))(d, s, EGL_SWAP_BEHAVIOR, EGL_BUFFER_PRESERVED);
@@ -395,16 +398,91 @@ EGLBoolean eglSurfaceAttrib(EGLDisplay d, EGLSurface s, EGLint attr, EGLint v) {
     if (r && attr == EGL_RENDER_BUFFER && v == EGL_SINGLE_BUFFER) frontBuffer(s);
     return r;
 }
+static void dumpSwap(EGLDisplay d, EGLSurface s);
 // swaps on window surfaces (logged occasionally)
 EGLBoolean eglSwapBuffers(EGLDisplay d, EGLSurface s) {
     static EGLBoolean (*f)(EGLDisplay, EGLSurface); if (!f) f = real("eglSwapBuffers");
+    dumpSwap(d, s);
     EGLBoolean r = f(d, s);
     static unsigned n; if (n < 3 || n % 500 == 0) LOG("eglSwapBuffers(%p) #%u -> %d (0x%x)", s, n, r, ((EGLint (*)(void))real("eglGetError"))()); n++;
     return r;
 }
+// debug: debug.macvr.dumpswap=<process name> writes each window surface's frame to /data/local/tmp/swap-<pid>-<w>x<h>.rgba
+#include <sys/system_properties.h>
+static void dumpSwap(EGLDisplay d, EGLSurface s) {
+    static int want = -1; char v[PROP_VALUE_MAX] = {0};
+    if (want < 0) {
+        char n[64] = {0}; FILE *f = fopen("/proc/self/cmdline", "r"); if (f) { fread(n, 1, 63, f); fclose(f); }
+        __system_property_get("debug.macvr.dumpswap", v); want = v[0] && !strcmp(v, n);
+    }
+    if (!want) return;
+    EGLint w = 0, h = 0;
+    ((EGLBoolean (*)(EGLDisplay, EGLSurface, EGLint, EGLint *))real("eglQuerySurface"))(d, s, EGL_WIDTH, &w);
+    ((EGLBoolean (*)(EGLDisplay, EGLSurface, EGLint, EGLint *))real("eglQuerySurface"))(d, s, EGL_HEIGHT, &h);
+    if (w <= 0 || h <= 0 || w * h > 16 << 20) return;
+    void *px = malloc((size_t)w * h * 4);
+    ((void (*)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *))gl("glReadPixels"))(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    char path[128]; snprintf(path, sizeof path, "/data/local/tmp/swap-%d-%dx%d.rgba", getpid(), w, h);
+    FILE *o = fopen(path, "wb"); if (o) { fwrite(px, 4, (size_t)w * h, o); fclose(o); }
+    free(px);
+}
 EGLBoolean eglSwapBuffersWithDamageKHR(EGLDisplay d, EGLSurface s, EGLint *rects, EGLint n_) {
     static EGLBoolean (*f)(EGLDisplay, EGLSurface, EGLint *, EGLint); if (!f) f = real("eglSwapBuffersWithDamageKHR");
+    dumpSwap(d, s);
     EGLBoolean r = f(d, s, rects, n_);
     static unsigned n; if (n < 3 || n % 500 == 0) LOG("eglSwapBuffersWithDamageKHR(%p) #%u -> %d", s, n, r); n++;
     return r;
 }
+
+// ---- Android-surface swapchain placeholder size (runtime process only) ----
+// The runtime starts each Android-surface swapchain as an image reader of 65536x65536 until the producer's real
+// size arrives, and SurfaceFlinger sizes the virtual display that feeds it from that placeholder. The Quest's gralloc
+// just refuses such a buffer; the emulator's host GPU tries to allocate it and crashes. Readers above the host's
+// limit start at 4096 instead (the display is resized to the panel's real size right after, as on the headset).
+// The runtime's own import of AImageReader_newWithUsage is pointed here (a GOT entry; nothing else changes).
+#include <link.h>
+#include <media/NdkImageReader.h>
+#include <sys/mman.h>
+static media_status_t (*realNewReader)(int32_t, int32_t, int32_t, uint64_t, int32_t, AImageReader **);
+static int32_t clampDim(int32_t v) { return v > 16384 ? 4096 : v; }
+static media_status_t newReader(int32_t w, int32_t h, int32_t fmt, uint64_t usage, int32_t maxImages, AImageReader **out) {
+    if (clampDim(w) != w || clampDim(h) != h) LOG("image reader %dx%d -> %dx%d", w, h, clampDim(w), clampDim(h));
+    return realNewReader(clampDim(w), clampDim(h), fmt, usage, maxImages, out);
+}
+// android::SurfaceTexture::setDefaultBufferSize(uint32_t, uint32_t), as called for Java SurfaceTextures (GLES swapchains)
+static int32_t (*realStSize)(void *, uint32_t, uint32_t);
+static int32_t stSize(void *self, uint32_t w, uint32_t h) {
+    if (w > 16384 || h > 16384) LOG("surface texture %ux%u -> %dx%d", w, h, clampDim(w), clampDim(h));
+    return realStSize(self, clampDim(w), clampDim(h));
+}
+static const struct { const char *lib, *sym; void *fn, **orig; } hooks[] = {
+    {"libvrruntimeservice.so", "AImageReader_newWithUsage", (void *)newReader, (void **)&realNewReader},
+    {"libandroid_runtime.so", "_ZN7android14SurfaceTexture20setDefaultBufferSizeEjj", (void *)stSize, (void **)&realStSize},
+};
+static int patchGot(struct dl_phdr_info *info, size_t size, void *data) {
+    for (unsigned h = 0; h < sizeof hooks / sizeof *hooks; h++) {
+        if (!info->dlpi_name || !strstr(info->dlpi_name, hooks[h].lib)) continue;
+        ElfW(Dyn) *dyn = NULL;
+        for (int i = 0; i < info->dlpi_phnum; i++) if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) dyn = (void *)(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
+        if (!dyn) continue;
+        ElfW(Sym) *sym = NULL; const char *str = NULL; ElfW(Rela) *rel = NULL; size_t relsz = 0;
+        for (ElfW(Dyn) *d = dyn; d->d_tag != DT_NULL; d++) {
+            if (d->d_tag == DT_SYMTAB) sym = (void *)(info->dlpi_addr + d->d_un.d_ptr);
+            if (d->d_tag == DT_STRTAB) str = (void *)(info->dlpi_addr + d->d_un.d_ptr);
+            if (d->d_tag == DT_JMPREL) rel = (void *)(info->dlpi_addr + d->d_un.d_ptr);
+            if (d->d_tag == DT_PLTRELSZ) relsz = d->d_un.d_val;
+        }
+        for (size_t i = 0; rel && sym && str && i < relsz / sizeof *rel; i++) {
+            if (strcmp(str + sym[ELF64_R_SYM(rel[i].r_info)].st_name, hooks[h].sym)) continue;
+            void **got = (void **)(info->dlpi_addr + rel[i].r_offset);
+            uintptr_t page = (uintptr_t)got & ~(uintptr_t)4095;
+            if (mprotect((void *)page, 4096, PROT_READ | PROT_WRITE)) { LOG("hook %s: mprotect failed", hooks[h].sym); break; }
+            *hooks[h].orig = *got; *got = hooks[h].fn;
+            mprotect((void *)page, 4096, PROT_READ);
+            LOG("hook %s in %s installed", hooks[h].sym, hooks[h].lib);
+            break;
+        }
+    }
+    return 0;
+}
+static void hookRuntime(void) { static int done; if (!done) { done = 1; dl_iterate_phdr(patchGot, NULL); } }

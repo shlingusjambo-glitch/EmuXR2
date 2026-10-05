@@ -51,7 +51,7 @@ typedef struct {
     FN(CreateFence); FN(DestroyFence); FN(WaitForFences);
     FN(CreateImageView); FN(DestroyImageView); FN(CreateFramebuffer); FN(DestroyFramebuffer);
     FN(CmdBeginRenderPass); FN(CmdBeginRenderPass2); FN(CmdBeginRenderPass2KHR);
-    FN(CmdClearColorImage); FN(CreateRenderPass); FN(CreateRenderPass2); FN(CmdNextSubpass); FN(CmdEndRenderPass); FN(CmdBlitImage); FN(CmdCopyBufferToImage); FN(CmdResolveImage);
+    FN(CmdClearColorImage); FN(CmdBeginRendering); FN(CmdBeginRenderingKHR); FN(CreateRenderPass); FN(CreateRenderPass2); FN(CmdNextSubpass); FN(CmdEndRenderPass); FN(CmdBlitImage); FN(CmdCopyBufferToImage); FN(CmdResolveImage);
     VkCommandPool pool[8];   // per queue family, for our copy command buffers
     VkImage lastExt;         // external image whose requirements were queried last
 } Dev;
@@ -323,7 +323,7 @@ static VkResult CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, 
         GET(CreateFence); GET(DestroyFence); GET(WaitForFences);
         GET(CreateImageView); GET(DestroyImageView); GET(CreateFramebuffer); GET(DestroyFramebuffer);
         GET(CmdBeginRenderPass); GET(CmdBeginRenderPass2); GET(CmdBeginRenderPass2KHR);
-        GET(CmdClearColorImage); GET(CreateRenderPass); GET(CreateRenderPass2); GET(CmdNextSubpass); GET(CmdEndRenderPass); GET(CmdBlitImage); GET(CmdCopyBufferToImage); GET(CmdResolveImage);
+        GET(CmdClearColorImage); GET(CmdBeginRendering); GET(CmdBeginRenderingKHR); GET(CreateRenderPass); GET(CreateRenderPass2); GET(CmdNextSubpass); GET(CmdEndRenderPass); GET(CmdBlitImage); GET(CmdCopyBufferToImage); GET(CmdResolveImage);
     }
     if (!worker) pthread_create(&worker, NULL, workerMain, NULL);
     pthread_mutex_unlock(&lock);
@@ -614,7 +614,8 @@ static VkResult CreateImageView(VkDevice dev, const VkImageViewCreateInfo *ci, c
     VkResult r = d->CreateImageView(dev, ci, a, out);
     pthread_mutex_lock(&lock);
     Shared *s = byImage(ci->image);
-    if (!r && s && s->complex) addTo(slot(views, 256, (void *)*out, 1), s);
+    if (!r && s && s->complex) { Track *t = slot(views, 256, (void *)*out, 1); if (!t) LOG("view table full"); addTo(t, s); }
+    if (!r && s) { static unsigned n; if (n++ < 20) LOG("view %p on shared %ux%u complex %d", (void *)*out, s->ci.extent.width, s->ci.extent.height, s->complex); }
     pthread_mutex_unlock(&lock);
     return r;
 }
@@ -631,7 +632,9 @@ static VkResult CreateFramebuffer(VkDevice dev, const VkFramebufferCreateInfo *c
         for (uint32_t i = 0; i < ci->attachmentCount; i++) {
             Track *v = slot(views, 256, (void *)ci->pAttachments[i], 0);
             if (v) for (int k = 0; k < 8; k++) addTo(slot(fbs, 256, (void *)*out, 1), v->s[k]);
+            if (v && v->s[0]) { static unsigned n; if (n++ < 20) LOG("framebuffer %p: attachment %u is shared %ux%u", (void *)*out, i, v->s[0]->ci.extent.width, v->s[0]->ci.extent.height); }
         }
+    if (!r && !ci->pAttachments) { static unsigned n; if (n++ < 5) LOG("framebuffer %p: imageless", (void *)*out); }
     pthread_mutex_unlock(&lock);
     return r;
 }
@@ -663,6 +666,18 @@ static void CmdBeginRenderPass2(VkCommandBuffer cb, const VkRenderPassBeginInfo 
     if (!d->CreateRenderPass2) d->CmdBeginRenderPass(cb, bi, si->contents);   // render passes are v1 underneath
     else (d->CmdBeginRenderPass2 ? d->CmdBeginRenderPass2 : d->CmdBeginRenderPass2KHR)(cb, bi, si);
 }
+// dynamic rendering (Vulkan 1.3; ShellEnv draws its eye buffers this way): the attachments it writes
+static void markViews(VkCommandBuffer cb, const VkRenderingInfo *ri) {
+    Shared *list[16]; int n = 0;
+    pthread_mutex_lock(&lock);
+    for (uint32_t i = 0; i < ri->colorAttachmentCount; i++) {
+        VkImageView vs[2] = {ri->pColorAttachments[i].imageView, ri->pColorAttachments[i].resolveImageView};
+        for (int j = 0; j < 2; j++) { Track *v = vs[j] ? slot(views, 256, (void *)vs[j], 0) : NULL; if (v) for (int k = 0; k < 8 && n < 16; k++) if (v->s[k]) list[n++] = v->s[k]; }
+    }
+    pthread_mutex_unlock(&lock);
+    for (int i = 0; i < n; i++) markCb(cb, list[i]);
+}
+static void CmdBeginRendering(VkCommandBuffer cb, const VkRenderingInfo *ri) { markViews(cb, ri); Dev *d = cbDev(cb); (d->CmdBeginRendering ? d->CmdBeginRendering : d->CmdBeginRenderingKHR)(cb, ri); }
 static void CmdClearColorImage(VkCommandBuffer cb, VkImage im, VkImageLayout l, const VkClearColorValue *c, uint32_t n, const VkImageSubresourceRange *r) {
     markCb(cb, byImage(im)); cbDev(cb)->CmdClearColorImage(cb, im, l, c, n, r);
 }
@@ -769,6 +784,9 @@ static VkResult QueueSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo *s
     VkCommandBuffer preCb[64], postCb[64]; int a = 0, b = 0;
     for (int i = 0; i < nr; i++) { VkCommandBuffer c = copyCmd(pre[i], q->family, 1); if (c) preCb[a++] = c; }
     for (int i = 0; i < np; i++) { VkCommandBuffer c = copyCmd(post[i], q->family, 0); if (c) postCb[b++] = c; }
+    { static unsigned logged; if (logged < 40 && (np || nr)) { logged++;
+        for (int i = 0; i < np; i++) LOG("submit: out %ux%u x%u layers", post[i]->ci.extent.width, post[i]->ci.extent.height, post[i]->ci.arrayLayers);
+        for (int i = 0; i < nr; i++) LOG("submit: in %ux%u x%u layers", pre[i]->ci.extent.width, pre[i]->ci.extent.height, pre[i]->ci.arrayLayers); } }
     uint32_t n = count ? count : 1;
     VkSubmitInfo *si = calloc(n, sizeof *si);
     if (count) memcpy(si, submits, count * sizeof *si); else si[0].sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -831,6 +849,8 @@ static PFN_vkVoidFunction deviceHook(const char *n) {
     HOOK("vkCmdBeginRenderPass2", CmdBeginRenderPass2);
     HOOK("vkCmdBeginRenderPass2KHR", CmdBeginRenderPass2);
     HOOK("vkCmdClearColorImage", CmdClearColorImage);
+    HOOK("vkCmdBeginRendering", CmdBeginRendering);
+    HOOK("vkCmdBeginRenderingKHR", CmdBeginRendering);
     HOOK("vkCmdBlitImage", CmdBlitImage);
     HOOK("vkCmdCopyImage", CmdCopyImage);
     HOOK("vkCmdCopyBufferToImage", CmdCopyBufferToImage);
