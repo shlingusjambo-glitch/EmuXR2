@@ -1,0 +1,3 @@
+
+# macvr
+ro.surface_flinger.has_writeback_dpu_cac=false

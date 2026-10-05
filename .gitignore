@@ -1,0 +1,9 @@
+# Nothing derived from anyone's firmware is ever committed: build outputs link against or embed it.
+out/
+hal/lib/
+*.img
+*.apk
+*.so
+*.cil
+.DS_Store
+__pycache__/
