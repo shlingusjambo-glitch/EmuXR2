@@ -20,3 +20,7 @@ put emu/emu_vendor.img "$H/hal/macvr-hal.xml" /etc/vintf/manifest/macvr-hal.xml 
 put emu/emu_vendor.img "$H/vk/out/vulkan.macvr.so" /lib64/hw/vulkan.macvr.so u:object_r:same_process_hal_file:s0
 sed -i '' 's/setprop ro.hardware.vulkan ranchu/setprop ro.hardware.vulkan macvr/' work/init.ranchu.rc
 put emu/emu_vendor.img work/init.ranchu.rc /etc/init/hw/init.ranchu.rc
+# the camera mux configuration from the user's own firmware, for the sensor HAL stand-in
+mkdir -p work/macvr && python3 "$H/hal/muxconfig.py" fs/vendor/etc/cameramuxmode/configv2.json > work/macvr/muxmode.txt
+$D -w -R "mkdir /etc/macvr" emu/emu_vendor.img >/dev/null 2>&1 || true
+put emu/emu_vendor.img work/macvr/muxmode.txt /etc/macvr/muxmode.txt u:object_r:vendor_configs_file:s0

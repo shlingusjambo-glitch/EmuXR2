@@ -34,3 +34,12 @@ kernel and vendor layer (Android 12L, API 32, arm64 on Hypervisor.framework). On
 ## License
 
 GPL-3.0. See `LICENSE`.
+
+## Status (2026-10-05)
+
+Boots the Quest's Android to `sys.boot_completed`. Meta's VR runtime, VrShell, ShellEnv, SystemUX, Horizon and Store
+all run; the compositor runs and the headset counts as mounted (display on). The screen is still black.
+
+Current blocker: `trackingservice` aborts with "Unable to parse IMU calibration for IMU with ID 0" (calibration JSON
+built in `hal/sensors.cpp`; schema recovered with `strorder.py`/`strrefs.py`). Once it starts, poses go in through
+Meta's own `TrackingDataInjection` service (`libtrackinginjection-service.so`, allowed for uid 0/1000).

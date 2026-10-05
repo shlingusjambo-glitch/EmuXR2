@@ -8,4 +8,46 @@
             <instance>default</instance>
         </interface>
     </hal>
+    <hal format="hidl">
+        <name>vendor.oculus.hardware.sensors_java</name>
+        <transport>hwbinder</transport>
+        <version>1.0</version>
+        <interface>
+            <name>IPowerstate</name>
+            <instance>default</instance>
+        </interface>
+    </hal>
+    <hal format="hidl">
+        <name>vendor.oculus.hardware.sensors</name>
+        <transport>hwbinder</transport>
+        <version>1.0</version>
+        <interface>
+            <name>ICameraProvider</name>
+            <instance>default</instance>
+        </interface>
+        <interface>
+            <name>IControllerProvider</name>
+            <instance>default</instance>
+        </interface>
+        <interface>
+            <name>IExternalTimingProvider</name>
+            <instance>default</instance>
+        </interface>
+        <interface>
+            <name>IImu</name>
+            <instance>default</instance>
+        </interface>
+        <interface>
+            <name>IIad</name>
+            <instance>default</instance>
+        </interface>
+        <interface>
+            <name>IMag</name>
+            <instance>default</instance>
+        </interface>
+        <interface>
+            <name>IZapper</name>
+            <instance>default</instance>
+        </interface>
+    </hal>
 </manifest>

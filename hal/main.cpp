@@ -2,8 +2,12 @@
 #include <hidl/HidlTransportSupport.h>
 #include <log/log.h>
 void registerComposer();
+void registerPowerstate();
+void registerSensors();
 int main() {
     ::android::hardware::configureRpcThreadpool(4, true);
     registerComposer();
+    registerPowerstate();
+    registerSensors();
     ::android::hardware::joinRpcThreadpool();
 }
