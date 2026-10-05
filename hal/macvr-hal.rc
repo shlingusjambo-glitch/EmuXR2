@@ -16,3 +16,9 @@ on init
     write /sys/class/drm/sde-crtc-0/vsync_event "VSYNC=0"
     chown system system /sys/class/drm/sde-crtc-0/vsync_event
     chmod 0644 /sys/class/drm/sde-crtc-0/vsync_event
+
+# first-time setup pairs the headset with a phone, which an emulator can't do: record it as done, as finishing it would
+on property:sys.boot_completed=1
+    exec - system system -- /system/bin/oculuspreferences --setc first_time_nux_complete true first_time_nux_pre_ota_complete true first_time_nux_guardian_setup_complete true
+    exec - system system -- /system/bin/settings put global device_provisioned 1
+    exec - system system -- /system/bin/settings put secure user_setup_complete 1

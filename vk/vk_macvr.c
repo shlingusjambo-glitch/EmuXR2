@@ -47,11 +47,11 @@ typedef struct {
     FN(GetImageMemoryRequirements); FN(GetImageMemoryRequirements2);
     FN(GetMemoryAndroidHardwareBufferANDROID); FN(GetAndroidHardwareBufferPropertiesANDROID);
     FN(CreateCommandPool); FN(AllocateCommandBuffers); FN(FreeCommandBuffers); FN(BeginCommandBuffer); FN(EndCommandBuffer);
-    FN(CmdPipelineBarrier); FN(CmdCopyImage); FN(QueueSubmit); FN(GetDeviceQueue); FN(GetDeviceQueue2);
+    FN(CmdPipelineBarrier); FN(CmdCopyImage); FN(QueueSubmit); FN(QueueSubmit2); FN(QueueSubmit2KHR); FN(GetDeviceQueue); FN(GetDeviceQueue2);
     FN(CreateFence); FN(DestroyFence); FN(WaitForFences);
     FN(CreateImageView); FN(DestroyImageView); FN(CreateFramebuffer); FN(DestroyFramebuffer);
     FN(CmdBeginRenderPass); FN(CmdBeginRenderPass2); FN(CmdBeginRenderPass2KHR);
-    FN(CmdClearColorImage); FN(CmdBeginRendering); FN(CmdBeginRenderingKHR); FN(CreateRenderPass); FN(CreateRenderPass2); FN(CmdNextSubpass); FN(CmdEndRenderPass); FN(CmdBlitImage); FN(CmdCopyBufferToImage); FN(CmdResolveImage);
+    FN(CmdClearColorImage); FN(CmdBeginRendering); FN(CmdBeginRenderingKHR); FN(CmdPipelineBarrier2); FN(CmdPipelineBarrier2KHR); FN(CmdExecuteCommands); FN(CmdCopyImage2); FN(CmdBlitImage2); FN(CmdResolveImage2); FN(CmdCopyBufferToImage2); FN(CmdCopyImage2KHR); FN(CmdBlitImage2KHR); FN(CmdResolveImage2KHR); FN(CmdCopyBufferToImage2KHR); FN(CreateRenderPass); FN(CreateRenderPass2); FN(CmdNextSubpass); FN(CmdEndRenderPass); FN(CmdBlitImage); FN(CmdCopyBufferToImage); FN(CmdResolveImage);
     VkCommandPool pool[8];   // per queue family, for our copy command buffers
     VkImage lastExt;         // external image whose requirements were queried last
 } Dev;
@@ -216,6 +216,7 @@ static void addTo(Track *t, Shared *s) {
 }
 static void markCb(VkCommandBuffer cb, Shared *s) {
     if (!s || !s->complex) return;
+    if (s->ci.arrayLayers > 1) { static unsigned n; if (n++ % 500 == 0) LOG("stereo marked #%u %ux%u", n, s->ci.extent.width, s->ci.extent.height); }
     pthread_mutex_lock(&lock); addTo(slot(cbs, MAXT, cb, 1), s); pthread_mutex_unlock(&lock);
 }
 
@@ -319,11 +320,11 @@ static VkResult CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, 
         if (!d->GetImageMemoryRequirements2) d->GetImageMemoryRequirements2 = (void *)realGDPA(*out, "vkGetImageMemoryRequirements2KHR");
         GET(GetMemoryAndroidHardwareBufferANDROID); GET(GetAndroidHardwareBufferPropertiesANDROID);
         GET(CreateCommandPool); GET(AllocateCommandBuffers); GET(FreeCommandBuffers); GET(BeginCommandBuffer); GET(EndCommandBuffer);
-        GET(CmdPipelineBarrier); GET(CmdCopyImage); GET(QueueSubmit); GET(GetDeviceQueue); GET(GetDeviceQueue2);
+        GET(CmdPipelineBarrier); GET(CmdCopyImage); GET(QueueSubmit); GET(QueueSubmit2); GET(QueueSubmit2KHR); GET(GetDeviceQueue); GET(GetDeviceQueue2);
         GET(CreateFence); GET(DestroyFence); GET(WaitForFences);
         GET(CreateImageView); GET(DestroyImageView); GET(CreateFramebuffer); GET(DestroyFramebuffer);
         GET(CmdBeginRenderPass); GET(CmdBeginRenderPass2); GET(CmdBeginRenderPass2KHR);
-        GET(CmdClearColorImage); GET(CmdBeginRendering); GET(CmdBeginRenderingKHR); GET(CreateRenderPass); GET(CreateRenderPass2); GET(CmdNextSubpass); GET(CmdEndRenderPass); GET(CmdBlitImage); GET(CmdCopyBufferToImage); GET(CmdResolveImage);
+        GET(CmdClearColorImage); GET(CmdBeginRendering); GET(CmdBeginRenderingKHR); GET(CmdPipelineBarrier2); GET(CmdPipelineBarrier2KHR); GET(CmdExecuteCommands); GET(CmdCopyImage2); GET(CmdBlitImage2); GET(CmdResolveImage2); GET(CmdCopyBufferToImage2); GET(CmdCopyImage2KHR); GET(CmdBlitImage2KHR); GET(CmdResolveImage2KHR); GET(CmdCopyBufferToImage2KHR); GET(CreateRenderPass); GET(CreateRenderPass2); GET(CmdNextSubpass); GET(CmdEndRenderPass); GET(CmdBlitImage); GET(CmdCopyBufferToImage); GET(CmdResolveImage);
     }
     if (!worker) pthread_create(&worker, NULL, workerMain, NULL);
     pthread_mutex_unlock(&lock);
@@ -385,6 +386,8 @@ static VkResult GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice pd, con
 static VkResult CreateImage(VkDevice dev, const VkImageCreateInfo *ci, const VkAllocationCallbacks *a, VkImage *out) {
     Dev *d = findDev(dev);
     const VkExternalMemoryImageCreateInfo *e = (const void *)find(ci->pNext, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
+    if (e && (e->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID)) {
+        static unsigned n; if (n++ < 20) LOG("AHB image %ux%u x%u layers usage 0x%x", ci->extent.width, ci->extent.height, ci->arrayLayers, ci->usage); }
     if (!e || !(e->handleTypes & OPAQUE)) return d->CreateImage(dev, ci, a, out);
     // Native Android buffers cannot carry storage-image usage on the Mac host driver.
     int complex = (ci->usage & VK_IMAGE_USAGE_STORAGE_BIT) || ci->arrayLayers > 1 || ci->mipLevels > 1 || ci->imageType != VK_IMAGE_TYPE_2D || ci->samples != VK_SAMPLE_COUNT_1_BIT
@@ -615,6 +618,7 @@ static VkResult CreateImageView(VkDevice dev, const VkImageViewCreateInfo *ci, c
     pthread_mutex_lock(&lock);
     Shared *s = byImage(ci->image);
     if (!r && s && s->complex) { Track *t = slot(views, 256, (void *)*out, 1); if (!t) LOG("view table full"); addTo(t, s); }
+    if (!r && ci->subresourceRange.layerCount > 1 || (!r && !s && ci->image)) { static unsigned m; if (m++ < 30 && !s) LOG("view %p on unshared image %p", (void *)*out, (void *)ci->image); }
     if (!r && s) { static unsigned n; if (n++ < 20) LOG("view %p on shared %ux%u complex %d", (void *)*out, s->ci.extent.width, s->ci.extent.height, s->complex); }
     pthread_mutex_unlock(&lock);
     return r;
@@ -627,6 +631,10 @@ static void DestroyImageView(VkDevice dev, VkImageView v, const VkAllocationCall
 static VkResult CreateFramebuffer(VkDevice dev, const VkFramebufferCreateInfo *ci, const VkAllocationCallbacks *a, VkFramebuffer *out) {
     Dev *d = findDev(dev);
     VkResult r = d->CreateFramebuffer(dev, ci, a, out);
+    if (ci->width == 1440) { static unsigned n; if (n++ < 10) {
+        char b[256] = {0}; int o = 0;
+        for (uint32_t i = 0; i < ci->attachmentCount && ci->pAttachments && o < 200; i++) { Track *v = slot(views, 256, (void *)ci->pAttachments[i], 0); o += snprintf(b + o, sizeof b - o, " %p:%d", (void *)ci->pAttachments[i], v && v->s[0]); }
+        LOG("framebuffer %ux%ux%u flags 0x%x attachments %u%s", ci->width, ci->height, ci->layers, ci->flags, ci->attachmentCount, b); } }
     pthread_mutex_lock(&lock);
     if (!r && ci->pAttachments)
         for (uint32_t i = 0; i < ci->attachmentCount; i++) {
@@ -660,9 +668,11 @@ static void markPass(VkCommandBuffer cb, const VkRenderPassBeginInfo *bi) {
     pthread_mutex_unlock(&lock);
     for (int i = 0; i < n; i++) markCb(cb, list[i]);
 }
-static void CmdBeginRenderPass(VkCommandBuffer cb, const VkRenderPassBeginInfo *bi, VkSubpassContents c) { markPass(cb, bi); cbDev(cb)->CmdBeginRenderPass(cb, bi, c); }
+static void CmdBeginRenderPass(VkCommandBuffer cb, const VkRenderPassBeginInfo *bi, VkSubpassContents c) { markPass(cb, bi);
+    { static unsigned n; if (n++ < 15) { Track *f = slot(fbs, 256, (void *)bi->framebuffer, 0); LOG("render pass %ux%u shared %d", bi->renderArea.extent.width, bi->renderArea.extent.height, f && f->s[0]); } } cbDev(cb)->CmdBeginRenderPass(cb, bi, c); }
 static void CmdBeginRenderPass2(VkCommandBuffer cb, const VkRenderPassBeginInfo *bi, const VkSubpassBeginInfo *si) {
     markPass(cb, bi); Dev *d = cbDev(cb);
+    { static unsigned n; if (n++ < 15) { Track *f = slot(fbs, 256, (void *)bi->framebuffer, 0); LOG("render pass2 %ux%u shared %d", bi->renderArea.extent.width, bi->renderArea.extent.height, f && f->s[0]); } }
     if (!d->CreateRenderPass2) d->CmdBeginRenderPass(cb, bi, si->contents);   // render passes are v1 underneath
     else (d->CmdBeginRenderPass2 ? d->CmdBeginRenderPass2 : d->CmdBeginRenderPass2KHR)(cb, bi, si);
 }
@@ -677,7 +687,45 @@ static void markViews(VkCommandBuffer cb, const VkRenderingInfo *ri) {
     pthread_mutex_unlock(&lock);
     for (int i = 0; i < n; i++) markCb(cb, list[i]);
 }
-static void CmdBeginRendering(VkCommandBuffer cb, const VkRenderingInfo *ri) { markViews(cb, ri); Dev *d = cbDev(cb); (d->CmdBeginRendering ? d->CmdBeginRendering : d->CmdBeginRenderingKHR)(cb, ri); }
+static void CmdBeginRendering(VkCommandBuffer cb, const VkRenderingInfo *ri) { markViews(cb, ri);
+    { static unsigned n; if (n++ < 15) LOG("dynamic rendering %ux%u views %u colors %u", ri->renderArea.extent.width, ri->renderArea.extent.height, ri->viewMask, ri->colorAttachmentCount); } Dev *d = cbDev(cb); (d->CmdBeginRendering ? d->CmdBeginRendering : d->CmdBeginRenderingKHR)(cb, ri); }
+// Whatever command writes a shared image, the app moves it into or out of a writable layout around it: barriers
+// are where writes are detected independent of the command used (copies, blits, resolves, render passes, compute).
+static int writable(VkImageLayout l) {
+    return l == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL || l == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL || l == VK_IMAGE_LAYOUT_GENERAL
+        || l == VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL;
+}
+static void CmdPipelineBarrier(VkCommandBuffer cb, VkPipelineStageFlags ss, VkPipelineStageFlags ds, VkDependencyFlags df, uint32_t nm,
+                               const VkMemoryBarrier *m, uint32_t nb, const VkBufferMemoryBarrier *b, uint32_t ni, const VkImageMemoryBarrier *im) {
+    for (uint32_t i = 0; i < ni; i++) {
+        Shared *sh = byImage(im[i].image);
+        if (sh) { static unsigned n; if (n++ < 30) LOG("barrier %ux%u x%u: layout %d -> %d", sh->ci.extent.width, sh->ci.extent.height, sh->ci.arrayLayers, im[i].oldLayout, im[i].newLayout); }
+        if (writable(im[i].newLayout) || writable(im[i].oldLayout)) markCb(cb, sh);
+    }
+    cbDev(cb)->CmdPipelineBarrier(cb, ss, ds, df, nm, m, nb, b, ni, im);
+}
+static void CmdPipelineBarrier2(VkCommandBuffer cb, const VkDependencyInfo *di) {
+    for (uint32_t i = 0; i < di->imageMemoryBarrierCount; i++) {
+        const VkImageMemoryBarrier2 *im = &di->pImageMemoryBarriers[i];
+        if (writable(im->newLayout) || writable(im->oldLayout)) markCb(cb, byImage(im->image));
+    }
+    Dev *d = cbDev(cb); (d->CmdPipelineBarrier2 ? d->CmdPipelineBarrier2 : d->CmdPipelineBarrier2KHR)(cb, di);
+}
+// secondary command buffers: what they write, the primary that runs them writes
+static void CmdExecuteCommands(VkCommandBuffer cb, uint32_t n, const VkCommandBuffer *sec) {
+    Shared *list[64]; int k = 0;
+    pthread_mutex_lock(&lock);
+    for (uint32_t i = 0; i < n; i++) { Track *t = slot(cbs, MAXT, sec[i], 0); if (t) for (int j = 0; j < 8 && k < 64; j++) if (t->s[j]) list[k++] = t->s[j]; }
+    pthread_mutex_unlock(&lock);
+    for (int i = 0; i < k; i++) markCb(cb, list[i]);
+    cbDev(cb)->CmdExecuteCommands(cb, n, sec);
+}
+// the Vulkan 1.3 forms of the transfer commands
+#define V2(name, Info, dstField) static void name(VkCommandBuffer cb, const Info *i) { markCb(cb, byImage(i->dstField)); Dev *d = cbDev(cb); (d->name ? d->name : d->name##KHR)(cb, i); }
+V2(CmdCopyImage2, VkCopyImageInfo2, dstImage)
+V2(CmdBlitImage2, VkBlitImageInfo2, dstImage)
+V2(CmdResolveImage2, VkResolveImageInfo2, dstImage)
+V2(CmdCopyBufferToImage2, VkCopyBufferToImageInfo2, dstImage)
 static void CmdClearColorImage(VkCommandBuffer cb, VkImage im, VkImageLayout l, const VkClearColorValue *c, uint32_t n, const VkImageSubresourceRange *r) {
     markCb(cb, byImage(im)); cbDev(cb)->CmdClearColorImage(cb, im, l, c, n, r);
 }
@@ -767,6 +815,8 @@ static VkResult QueueSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo *s
     for (uint32_t i = 0; i < count; i++)
         for (uint32_t c = 0; c < submits[i].commandBufferCount; c++) {
             Track *t = slot(cbs, MAXT, submits[i].pCommandBuffers[c], 0);
+            if (t) for (int k = 0; k < 8; k++) if (t->s[k] && (!t->s[k]->ready || t->s[k]->dev != d->dev)) {
+                static unsigned n; if (n++ < 20) LOG("submit skips %ux%u: ready %d same device %d", t->s[k]->ci.extent.width, t->s[k]->ci.extent.height, t->s[k]->ready, t->s[k]->dev == d->dev); }
             if (t) for (int k = 0; k < 8; k++) if (t->s[k] && t->s[k]->ready && t->s[k]->dev == d->dev) {
                 int dup = 0; for (int j = 0; j < np; j++) dup |= post[j] == t->s[k];
                 if (!dup && np < 64) post[np++] = t->s[k];
@@ -784,6 +834,7 @@ static VkResult QueueSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo *s
     VkCommandBuffer preCb[64], postCb[64]; int a = 0, b = 0;
     for (int i = 0; i < nr; i++) { VkCommandBuffer c = copyCmd(pre[i], q->family, 1); if (c) preCb[a++] = c; }
     for (int i = 0; i < np; i++) { VkCommandBuffer c = copyCmd(post[i], q->family, 0); if (c) postCb[b++] = c; }
+    for (int i = 0; i < np; i++) if (post[i]->ci.arrayLayers > 1) { static unsigned n; if (n++ % 500 == 0) LOG("stereo out #%u: %ux%u", n, post[i]->ci.extent.width, post[i]->ci.extent.height); }
     { static unsigned logged; if (logged < 40 && (np || nr)) { logged++;
         for (int i = 0; i < np; i++) LOG("submit: out %ux%u x%u layers", post[i]->ci.extent.width, post[i]->ci.extent.height, post[i]->ci.arrayLayers);
         for (int i = 0; i < nr; i++) LOG("submit: in %ux%u x%u layers", pre[i]->ci.extent.width, pre[i]->ci.extent.height, pre[i]->ci.arrayLayers); } }
@@ -822,6 +873,47 @@ static VkResult QueueSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo *s
     return r;
 }
 
+// vkQueueSubmit2 (Vulkan 1.3; Meta's Clay engine submits this way): the same copies, as their own batches in queue
+// order around the app's
+static VkResult QueueSubmit2(VkQueue queue, uint32_t count, const VkSubmitInfo2 *submits, VkFence fence) {
+    Q *q = NULL;
+    for (int i = 0; i < 64; i++) if (queues[i].q == queue) { q = &queues[i]; break; }
+    Dev *d = q ? q->d : cbDev((VkCommandBuffer)queue);
+    PFN_vkQueueSubmit2 real = d->QueueSubmit2 ? d->QueueSubmit2 : d->QueueSubmit2KHR;
+    if (!q) return real(queue, count, submits, fence);
+    Shared *post[64], *pre[64]; int np = 0, nr = 0;
+    pthread_mutex_lock(&lock);
+    for (uint32_t i = 0; i < count; i++)
+        for (uint32_t c = 0; c < submits[i].commandBufferInfoCount; c++) {
+            Track *t = slot(cbs, MAXT, submits[i].pCommandBufferInfos[c].commandBuffer, 0);
+            if (t) for (int k = 0; k < 8; k++) if (t->s[k] && t->s[k]->ready && t->s[k]->dev == d->dev) {
+                int dup = 0; for (int j = 0; j < np; j++) dup |= post[j] == t->s[k];
+                if (!dup && np < 64) post[np++] = t->s[k];
+            }
+        }
+    for (int i = 0; i < MAXSHARED && nr < 64; i++) {
+        Shared *s = shared[i];
+        if (s && s->dev == d->dev && s->complex && s->ready && s->gen && atomic_load(s->gen) != s->seen) { s->seen = atomic_load(s->gen); pre[nr++] = s; }
+    }
+    pthread_mutex_unlock(&lock);
+    VkCommandBuffer preCb[64], postCb[64]; int a = 0, b = 0;
+    for (int i = 0; i < nr; i++) { VkCommandBuffer c = copyCmd(pre[i], q->family, 1); if (c) preCb[a++] = c; }
+    for (int i = 0; i < np; i++) { VkCommandBuffer c = copyCmd(post[i], q->family, 0); if (c) postCb[b++] = c; }
+    if (a) { VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = a, .pCommandBuffers = preCb}; d->QueueSubmit(queue, 1, &si, VK_NULL_HANDLE); }
+    VkResult r = real(queue, count, submits, fence);
+    if (!r && b) {
+        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = b, .pCommandBuffers = postCb};
+        Job *j = calloc(1, sizeof *j);
+        VkFenceCreateInfo fi = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (!d->CreateFence(d->dev, &fi, NULL, &j->fence) && !d->QueueSubmit(queue, 1, &si, j->fence)) {
+            j->d = d; j->n = np; memcpy(j->s, post, j->n * sizeof *post);
+            pthread_mutex_lock(&lock); j->next = jobs; jobs = j; pthread_cond_signal(&jobCv); pthread_mutex_unlock(&lock);
+        } else free(j);
+    }
+    { static unsigned logged; if (logged < 20 && (np || nr)) { logged++; LOG("submit2: %d out, %d in", np, nr); } }
+    return r;
+}
+
 // ---- dispatch ----
 static PFN_vkVoidFunction GetDeviceProcAddr(VkDevice dev, const char *n);
 #define HOOK(name, fn) if (!strcmp(n, name)) return (PFN_vkVoidFunction)fn
@@ -850,6 +942,14 @@ static PFN_vkVoidFunction deviceHook(const char *n) {
     HOOK("vkCmdBeginRenderPass2KHR", CmdBeginRenderPass2);
     HOOK("vkCmdClearColorImage", CmdClearColorImage);
     HOOK("vkCmdBeginRendering", CmdBeginRendering);
+    HOOK("vkCmdExecuteCommands", CmdExecuteCommands);
+    HOOK("vkCmdCopyImage2", CmdCopyImage2); HOOK("vkCmdCopyImage2KHR", CmdCopyImage2);
+    HOOK("vkCmdBlitImage2", CmdBlitImage2); HOOK("vkCmdBlitImage2KHR", CmdBlitImage2);
+    HOOK("vkCmdResolveImage2", CmdResolveImage2); HOOK("vkCmdResolveImage2KHR", CmdResolveImage2);
+    HOOK("vkCmdCopyBufferToImage2", CmdCopyBufferToImage2); HOOK("vkCmdCopyBufferToImage2KHR", CmdCopyBufferToImage2);
+    HOOK("vkCmdPipelineBarrier", CmdPipelineBarrier);
+    HOOK("vkCmdPipelineBarrier2", CmdPipelineBarrier2);
+    HOOK("vkCmdPipelineBarrier2KHR", CmdPipelineBarrier2);
     HOOK("vkCmdBeginRenderingKHR", CmdBeginRendering);
     HOOK("vkCmdBlitImage", CmdBlitImage);
     HOOK("vkCmdCopyImage", CmdCopyImage);
@@ -859,6 +959,8 @@ static PFN_vkVoidFunction deviceHook(const char *n) {
     HOOK("vkGetDeviceQueue", GetDeviceQueue);
     HOOK("vkGetDeviceQueue2", GetDeviceQueue2);
     HOOK("vkQueueSubmit", QueueSubmit);
+    HOOK("vkQueueSubmit2", QueueSubmit2);
+    HOOK("vkQueueSubmit2KHR", QueueSubmit2);
     HOOK("vkCreateRenderPass2", CreateRenderPass2);
     HOOK("vkCreateRenderPass2KHR", CreateRenderPass2);
     HOOK("vkCmdNextSubpass2", CmdNextSubpass2);
