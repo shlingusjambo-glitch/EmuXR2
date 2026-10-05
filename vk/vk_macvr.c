@@ -43,7 +43,7 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 #define FN(x) PFN_vk##x x
 typedef struct {
     VkDevice dev; VkPhysicalDevice pd; VkPhysicalDeviceMemoryProperties mp;
-    FN(CreateImage); FN(DestroyImage); FN(CreateBuffer); FN(AllocateMemory); FN(FreeMemory); FN(BindImageMemory);
+    FN(CreateImage); FN(DestroyImage); FN(CreateBuffer); FN(AllocateMemory); FN(FreeMemory); FN(BindImageMemory); FN(BindImageMemory2);
     FN(GetImageMemoryRequirements); FN(GetImageMemoryRequirements2);
     FN(GetMemoryAndroidHardwareBufferANDROID); FN(GetAndroidHardwareBufferPropertiesANDROID);
     FN(CreateCommandPool); FN(AllocateCommandBuffers); FN(FreeCommandBuffers); FN(BeginCommandBuffer); FN(EndCommandBuffer);
@@ -51,7 +51,7 @@ typedef struct {
     FN(CreateFence); FN(DestroyFence); FN(WaitForFences);
     FN(CreateImageView); FN(DestroyImageView); FN(CreateFramebuffer); FN(DestroyFramebuffer);
     FN(CmdBeginRenderPass); FN(CmdBeginRenderPass2); FN(CmdBeginRenderPass2KHR);
-    FN(CmdClearColorImage); FN(CmdBlitImage); FN(CmdCopyBufferToImage); FN(CmdResolveImage);
+    FN(CmdClearColorImage); FN(CreateRenderPass); FN(CreateRenderPass2); FN(CmdNextSubpass); FN(CmdEndRenderPass); FN(CmdBlitImage); FN(CmdCopyBufferToImage); FN(CmdResolveImage);
     VkCommandPool pool[8];   // per queue family, for our copy command buffers
     VkImage lastExt;         // external image whose requirements were queried last
 } Dev;
@@ -110,101 +110,7 @@ static VkFormat ahbFormat(VkFormat f) {
     return f == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM : f == VK_FORMAT_B8G8R8A8_SRGB ? VK_FORMAT_B8G8R8A8_UNORM : f;
 }
 
-// ---- the fd message ----
-#define MAGIC 0x5852564d   // 'MVRX'
-typedef struct { uint32_t magic, count, layers, mips, len[MAXSH], fds[MAXSH], hasGen; } Hdr;
-
-// flatten an AHardwareBuffer the way AHardwareBuffer_sendHandleToUnixSocket does, into data + fds
-static int flatten(AHardwareBuffer *b, char *data, size_t cap, int *fds, int *nfd) {
-    int sv[2];
-    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv)) return -1;
-    int n = -1;
-    if (!AHardwareBuffer_sendHandleToUnixSocket(b, sv[0])) {
-        char ctl[CMSG_SPACE(sizeof(int) * 32)];
-        struct iovec iov = {data, cap};
-        struct msghdr m = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = ctl, .msg_controllen = sizeof ctl};
-        n = recvmsg(sv[1], &m, MSG_CMSG_CLOEXEC);
-        *nfd = 0;
-        for (struct cmsghdr *c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c))
-            if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
-                int k = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
-                memcpy(fds + *nfd, CMSG_DATA(c), k * sizeof(int)); *nfd += k;
-            }
-    }
-    close(sv[0]); close(sv[1]);
-    return n;
-}
-// rebuild an AHardwareBuffer from flattened data + fds (dups the fds)
-static AHardwareBuffer *unflatten(const char *data, size_t len, const int *fds, int nfd) {
-    int sv[2]; AHardwareBuffer *b = NULL;
-    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv)) return NULL;
-    char ctl[CMSG_SPACE(sizeof(int) * 32)];
-    struct iovec iov = {(void *)data, len};
-    struct msghdr m = {.msg_iov = &iov, .msg_iovlen = 1};
-    if (nfd) {
-        m.msg_control = ctl; m.msg_controllen = CMSG_SPACE(sizeof(int) * nfd);
-        struct cmsghdr *c = CMSG_FIRSTHDR(&m);
-        c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS; c->cmsg_len = CMSG_LEN(sizeof(int) * nfd);
-        memcpy(CMSG_DATA(c), fds, sizeof(int) * nfd);
-    }
-    if (sendmsg(sv[0], &m, 0) == (ssize_t)len) AHardwareBuffer_recvHandleFromUnixSocket(sv[1], &b);
-    close(sv[0]); close(sv[1]);
-    return b;
-}
-
-// build the exported fd from n buffers (+ the counter's memfd, or -1)
-static int sendBuffers(AHardwareBuffer **bufs, uint32_t n, uint32_t layers, uint32_t mips, int genFd) {
-    static char data[65536]; static int fds[250];
-    Hdr *h = (Hdr *)data; memset(h, 0, sizeof *h);
-    h->magic = MAGIC; h->count = n; h->layers = layers; h->mips = mips; h->hasGen = genFd >= 0;
-    size_t off = sizeof *h; int nfd = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        int k = 0, got = flatten(bufs[i], data + off, sizeof data - off, fds + nfd, &k);
-        if (got <= 0) { for (int j = 0; j < nfd; j++) close(fds[j]); return -1; }
-        h->len[i] = got; h->fds[i] = k; off += got; nfd += k;
-    }
-    if (genFd >= 0) fds[nfd++] = dup(genFd);
-    int sv[2];
-    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv)) { for (int j = 0; j < nfd; j++) close(fds[j]); return -1; }
-    char ctl[CMSG_SPACE(sizeof(int) * 250)];
-    struct iovec iov = {data, off};
-    struct msghdr m = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = ctl, .msg_controllen = CMSG_SPACE(sizeof(int) * nfd)};
-    struct cmsghdr *c = CMSG_FIRSTHDR(&m);
-    c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS; c->cmsg_len = CMSG_LEN(sizeof(int) * nfd);
-    memcpy(CMSG_DATA(c), fds, sizeof(int) * nfd);
-    ssize_t w = sendmsg(sv[0], &m, 0);
-    for (int j = 0; j < nfd; j++) close(fds[j]);
-    close(sv[0]);
-    if (w != (ssize_t)off) { close(sv[1]); return -1; }
-    return sv[1];
-}
-
-// read an exported fd without consuming it
-typedef struct { uint32_t n, layers, mips; AHardwareBuffer *buf[MAXSH]; int genFd; } Recv;
-static int recvBuffers(int fd, Recv *r) {
-    static char data[65536]; char ctl[CMSG_SPACE(sizeof(int) * 250)];
-    struct iovec iov = {data, sizeof data};
-    struct msghdr m = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = ctl, .msg_controllen = sizeof ctl};
-    ssize_t len = recvmsg(fd, &m, MSG_PEEK | MSG_CMSG_CLOEXEC);
-    if (len < (ssize_t)sizeof(Hdr)) return -1;
-    int fds[250], nfd = 0;
-    for (struct cmsghdr *c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c))
-        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
-            int k = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
-            memcpy(fds + nfd, CMSG_DATA(c), k * sizeof(int)); nfd += k;
-        }
-    Hdr *h = (Hdr *)data; int ok = h->magic == MAGIC && h->count <= MAXSH;
-    memset(r, 0, sizeof *r); r->genFd = -1;
-    size_t off = sizeof *h; int fo = 0;
-    for (uint32_t i = 0; ok && i < h->count; i++) {
-        r->buf[i] = unflatten(data + off, h->len[i], fds + fo, h->fds[i]);
-        ok = r->buf[i] != NULL; off += h->len[i]; fo += h->fds[i];
-    }
-    if (ok) { r->n = h->count; r->layers = h->layers; r->mips = h->mips; if (h->hasGen) r->genFd = dup(fds[fo]); }
-    for (int j = 0; j < nfd; j++) close(fds[j]);
-    if (!ok) for (uint32_t i = 0; i < MAXSH; i++) if (r->buf[i]) AHardwareBuffer_release(r->buf[i]);
-    return ok ? 0 : -1;
-}
+#include "fdmsg.h"
 
 // ---- shadows and copies ----
 static VkResult makeShadow(Shared *s, uint32_t i, AHardwareBuffer *import, AHardwareBuffer **exported) {
@@ -287,6 +193,11 @@ static void freeShared(Shared *s) {
     free(s);
 }
 
+// imports of layered/mipmapped memory that arrive before their image (ANGLE imports, then creates the image):
+// the shadows are made when the image is bound
+typedef struct { VkDevice dev; VkDeviceMemory mem; Recv rv; } Pending;
+static Pending pending[64];
+
 // ---- command buffer write tracking (importers: which shared images a submit writes) ----
 #define MAXT 2048
 typedef struct { void *key; Shared *s[8]; } Track;
@@ -327,6 +238,9 @@ static void *workerMain(void *u) {
     return u;
 }
 
+// extensions the wrapper provides itself (removed before the driver sees them)
+static const char *emulated[] = {VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME};
+
 // ---- instance level ----
 static VkResult EnumerateDeviceExtensionProperties(VkPhysicalDevice pd, const char *layer, uint32_t *count, VkExtensionProperties *props) {
     PFN_vkEnumerateDeviceExtensionProperties f = (void *)IPA("vkEnumerateDeviceExtensionProperties");
@@ -334,9 +248,12 @@ static VkResult EnumerateDeviceExtensionProperties(VkPhysicalDevice pd, const ch
     uint32_t n = 0; f(pd, NULL, &n, NULL);
     VkExtensionProperties *all = calloc(n + 1, sizeof *all);
     f(pd, NULL, &n, all);
-    int have = 0;
-    for (uint32_t i = 0; i < n; i++) if (!strcmp(all[i].extensionName, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)) have = 1;
-    if (!have) { strcpy(all[n].extensionName, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME); all[n].specVersion = 1; n++; }
+    all = realloc(all, (n + 8) * sizeof *all);
+    for (unsigned k = 0; k < sizeof emulated / sizeof *emulated; k++) {
+        int have = 0;
+        for (uint32_t i = 0; i < n; i++) if (!strcmp(all[i].extensionName, emulated[k])) have = 1;
+        if (!have) { memset(&all[n], 0, sizeof *all); strcpy(all[n].extensionName, emulated[k]); all[n].specVersion = 1; n++; }
+    }
     VkResult r = VK_SUCCESS;
     if (!props) *count = n;
     else { if (*count < n) r = VK_INCOMPLETE; else *count = n; memcpy(props, all, *count * sizeof *all); }
@@ -356,11 +273,17 @@ static VkResult CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, 
     const char **ext = calloc(ci->enabledExtensionCount + 8, sizeof *ext);
     uint32_t m = 0; int wantFd = 0;
     for (uint32_t i = 0; i < ci->enabledExtensionCount; i++) {
-        if (!strcmp(ci->ppEnabledExtensionNames[i], VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)) { wantFd = 1; continue; }
-        ext[m++] = ci->ppEnabledExtensionNames[i];
+        const char *e = ci->ppEnabledExtensionNames[i]; int ours = 0;
+        if (!strcmp(e, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)) wantFd = 1;
+        for (unsigned k = 0; k < sizeof emulated / sizeof *emulated; k++) if (!strcmp(e, emulated[k])) {
+            int real = 0;   // keep it if the driver has it after all
+            for (uint32_t j = 0; j < n; j++) if (!strcmp(avail[j].extensionName, e)) real = 1;
+            ours = !real;
+        }
+        if (!ours) ext[m++] = e;
     }
-    if (wantFd)
-        for (unsigned k = 0; k < sizeof need / sizeof *need; k++) {
+    // always: the runtime's client library imports swapchain memory on app devices that didn't ask for it
+    for (unsigned k = 0; k < sizeof need / sizeof *need; k++) {
             int on = 0, ok = 0;
             for (uint32_t i = 0; i < m; i++) if (!strcmp(ext[i], need[k])) on = 1;
             for (uint32_t i = 0; i < n; i++) if (!strcmp(avail[i].extensionName, need[k])) ok = 1;
@@ -377,7 +300,8 @@ static VkResult CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, 
         d->dev = *out; d->pd = pd;
         ((PFN_vkGetPhysicalDeviceMemoryProperties)IPA("vkGetPhysicalDeviceMemoryProperties"))(pd, &d->mp);
 #define GET(x) d->x = (void *)realGDPA(*out, "vk" #x)
-        GET(CreateImage); GET(DestroyImage); GET(CreateBuffer); GET(AllocateMemory); GET(FreeMemory); GET(BindImageMemory);
+        GET(CreateImage); GET(DestroyImage); GET(CreateBuffer); GET(AllocateMemory); GET(FreeMemory); GET(BindImageMemory); GET(BindImageMemory2);
+        if (!d->BindImageMemory2) d->BindImageMemory2 = (void *)realGDPA(*out, "vkBindImageMemory2KHR");
         GET(GetImageMemoryRequirements); GET(GetImageMemoryRequirements2);
         if (!d->GetImageMemoryRequirements2) d->GetImageMemoryRequirements2 = (void *)realGDPA(*out, "vkGetImageMemoryRequirements2KHR");
         GET(GetMemoryAndroidHardwareBufferANDROID); GET(GetAndroidHardwareBufferPropertiesANDROID);
@@ -386,7 +310,7 @@ static VkResult CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, 
         GET(CreateFence); GET(DestroyFence); GET(WaitForFences);
         GET(CreateImageView); GET(DestroyImageView); GET(CreateFramebuffer); GET(DestroyFramebuffer);
         GET(CmdBeginRenderPass); GET(CmdBeginRenderPass2); GET(CmdBeginRenderPass2KHR);
-        GET(CmdClearColorImage); GET(CmdBlitImage); GET(CmdCopyBufferToImage); GET(CmdResolveImage);
+        GET(CmdClearColorImage); GET(CreateRenderPass); GET(CreateRenderPass2); GET(CmdNextSubpass); GET(CmdEndRenderPass); GET(CmdBlitImage); GET(CmdCopyBufferToImage); GET(CmdResolveImage);
     }
     if (!worker) pthread_create(&worker, NULL, workerMain, NULL);
     pthread_mutex_unlock(&lock);
@@ -551,6 +475,15 @@ static VkResult AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *ai, con
             if (r) LOG("import %p: shadow failed %d", (void *)target, r);
             else LOG("import %p: %u shadows", (void *)target, s->n);
         }
+    } else if (!target && (rv.n > 1 || rv.genFd >= 0)) {   // shadowed, image not known yet: wait for the bind
+        r = d->AllocateMemory(dev, &m, a, out);
+        if (!r) {
+            pthread_mutex_lock(&lock);
+            int k = 0; while (k < 64 && pending[k].mem) k++;
+            if (k < 64) { pending[k] = (Pending){dev, *out, rv}; rv.n = 0; rv.genFd = -1; }
+            pthread_mutex_unlock(&lock);
+            if (k == 64) LOG("too many pending imports");
+        }
     } else {                 // direct: an AHardwareBuffer import
         VkImportAndroidHardwareBufferInfoANDROID ahb = {VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID, m.pNext, rv.buf[0]};
         VkAndroidHardwareBufferPropertiesANDROID p = {VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID};
@@ -616,6 +549,39 @@ static VkResult GetMemoryFdPropertiesKHR(VkDevice dev, VkExternalMemoryHandleTyp
     return VK_SUCCESS;
 }
 
+static void bindPending(VkDevice dev, VkImage image, VkDeviceMemory mem) {
+    pthread_mutex_lock(&lock);
+    Pending *p = NULL;
+    for (int k = 0; k < 64; k++) if (pending[k].mem == mem && pending[k].dev == dev) p = &pending[k];
+    Shared *s = p ? byImage(image) : NULL;
+    Pending got = p ? *p : (Pending){0};
+    if (p) memset(p, 0, sizeof *p);
+    pthread_mutex_unlock(&lock);
+    if (!p) return;
+    VkResult r = VK_ERROR_FORMAT_NOT_SUPPORTED;
+    if (s && s->complex) {
+        s->mem = mem; s->n = got.rv.n < MAXSH ? got.rv.n : MAXSH; r = VK_SUCCESS;
+        for (uint32_t i = 0; i < s->n && !r; i++) r = makeShadow(s, i, got.rv.buf[i], NULL);
+        if (got.rv.genFd >= 0) { s->genFd = got.rv.genFd; got.rv.genFd = -1; s->gen = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, s->genFd, 0); }
+        s->ready = !r;
+    }
+    LOG("bind %p: %u shadows from a pending import -> %d", (void *)image, got.rv.n, r);
+    for (uint32_t i = 0; i < got.rv.n; i++) AHardwareBuffer_release(got.rv.buf[i]);
+    if (got.rv.genFd >= 0) close(got.rv.genFd);
+}
+static VkResult BindImageMemory(VkDevice dev, VkImage im, VkDeviceMemory mem, VkDeviceSize off) {
+    Dev *d = findDev(dev);
+    VkResult r = d->BindImageMemory(dev, im, mem, off);
+    if (!r) bindPending(dev, im, mem);
+    return r;
+}
+static VkResult BindImageMemory2(VkDevice dev, uint32_t n, const VkBindImageMemoryInfo *bi) {
+    Dev *d = findDev(dev);
+    VkResult r = d->BindImageMemory2(dev, n, bi);
+    for (uint32_t i = 0; !r && i < n; i++) bindPending(dev, bi[i].image, bi[i].memory);
+    return r;
+}
+
 // ---- write tracking ----
 static VkResult CreateImageView(VkDevice dev, const VkImageViewCreateInfo *ci, const VkAllocationCallbacks *a, VkImageView *out) {
     Dev *d = findDev(dev);
@@ -667,7 +633,9 @@ static void markPass(VkCommandBuffer cb, const VkRenderPassBeginInfo *bi) {
 }
 static void CmdBeginRenderPass(VkCommandBuffer cb, const VkRenderPassBeginInfo *bi, VkSubpassContents c) { markPass(cb, bi); cbDev(cb)->CmdBeginRenderPass(cb, bi, c); }
 static void CmdBeginRenderPass2(VkCommandBuffer cb, const VkRenderPassBeginInfo *bi, const VkSubpassBeginInfo *si) {
-    markPass(cb, bi); Dev *d = cbDev(cb); (d->CmdBeginRenderPass2 ? d->CmdBeginRenderPass2 : d->CmdBeginRenderPass2KHR)(cb, bi, si);
+    markPass(cb, bi); Dev *d = cbDev(cb);
+    if (!d->CreateRenderPass2) d->CmdBeginRenderPass(cb, bi, si->contents);   // render passes are v1 underneath
+    else (d->CmdBeginRenderPass2 ? d->CmdBeginRenderPass2 : d->CmdBeginRenderPass2KHR)(cb, bi, si);
 }
 static void CmdClearColorImage(VkCommandBuffer cb, VkImage im, VkImageLayout l, const VkClearColorValue *c, uint32_t n, const VkImageSubresourceRange *r) {
     markCb(cb, byImage(im)); cbDev(cb)->CmdClearColorImage(cb, im, l, c, n, r);
@@ -688,6 +656,53 @@ static VkResult BeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBegi
     pthread_mutex_lock(&lock); Track *t = slot(cbs, MAXT, cb, 0); if (t) memset(t->s, 0, sizeof t->s); pthread_mutex_unlock(&lock);
     return cbDev(cb)->BeginCommandBuffer(cb, bi);
 }
+
+// ---- VK_KHR_create_renderpass2 over render pass v1 (the emulator's driver has only v1) ----
+static VkResult CreateRenderPass2(VkDevice dev, const VkRenderPassCreateInfo2 *ci, const VkAllocationCallbacks *a, VkRenderPass *out) {
+    Dev *d = findDev(dev);
+    if (d->CreateRenderPass2) return d->CreateRenderPass2(dev, ci, a, out);
+    VkAttachmentDescription *att = calloc(ci->attachmentCount + 1, sizeof *att);
+    for (uint32_t i = 0; i < ci->attachmentCount; i++) {
+        const VkAttachmentDescription2 *s2 = &ci->pAttachments[i];
+        att[i] = (VkAttachmentDescription){s2->flags, s2->format, s2->samples, s2->loadOp, s2->storeOp, s2->stencilLoadOp, s2->stencilStoreOp, s2->initialLayout, s2->finalLayout};
+    }
+    uint32_t refs = 0;
+    for (uint32_t i = 0; i < ci->subpassCount; i++) {
+        const VkSubpassDescription2 *sp = &ci->pSubpasses[i];
+        refs += sp->inputAttachmentCount + sp->colorAttachmentCount * 2 + 1;
+    }
+    VkAttachmentReference *ref = calloc(refs + 1, sizeof *ref), *r = ref;
+    VkSubpassDescription *sub = calloc(ci->subpassCount + 1, sizeof *sub);
+    uint32_t *views = calloc(ci->subpassCount + 1, sizeof *views); int multiview = 0;
+#define CONV(n, src) (src ? ({ VkAttachmentReference *b = r; for (uint32_t k = 0; k < (n); k++) *r++ = (VkAttachmentReference){(src)[k].attachment, (src)[k].layout}; b; }) : NULL)
+    for (uint32_t i = 0; i < ci->subpassCount; i++) {
+        const VkSubpassDescription2 *sp = &ci->pSubpasses[i];
+        sub[i].flags = sp->flags; sub[i].pipelineBindPoint = sp->pipelineBindPoint;
+        sub[i].inputAttachmentCount = sp->inputAttachmentCount; sub[i].pInputAttachments = CONV(sp->inputAttachmentCount, sp->pInputAttachments);
+        sub[i].colorAttachmentCount = sp->colorAttachmentCount; sub[i].pColorAttachments = CONV(sp->colorAttachmentCount, sp->pColorAttachments);
+        sub[i].pResolveAttachments = CONV(sp->colorAttachmentCount, sp->pResolveAttachments);
+        sub[i].pDepthStencilAttachment = CONV(1, sp->pDepthStencilAttachment);
+        sub[i].preserveAttachmentCount = sp->preserveAttachmentCount; sub[i].pPreserveAttachments = sp->pPreserveAttachments;
+        views[i] = sp->viewMask; multiview |= sp->viewMask != 0;
+    }
+    VkSubpassDependency *dep = calloc(ci->dependencyCount + 1, sizeof *dep);
+    int32_t *offs = calloc(ci->dependencyCount + 1, sizeof *offs);
+    for (uint32_t i = 0; i < ci->dependencyCount; i++) {
+        const VkSubpassDependency2 *d2 = &ci->pDependencies[i];
+        dep[i] = (VkSubpassDependency){d2->srcSubpass, d2->dstSubpass, d2->srcStageMask, d2->dstStageMask, d2->srcAccessMask, d2->dstAccessMask, d2->dependencyFlags};
+        offs[i] = d2->viewOffset;
+    }
+    VkRenderPassMultiviewCreateInfo mv = {VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO, ci->pNext, ci->subpassCount, views,
+        ci->dependencyCount, offs, ci->correlatedViewMaskCount, ci->pCorrelatedViewMasks};
+    VkRenderPassCreateInfo c = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, multiview ? (void *)&mv : (void *)ci->pNext, ci->flags,
+        ci->attachmentCount, att, ci->subpassCount, sub, ci->dependencyCount, dep};
+    VkResult res = d->CreateRenderPass(dev, &c, a, out);
+    free(att); free(ref); free(sub); free(views); free(dep); free(offs);
+    if (res) LOG("vkCreateRenderPass2 (as v1) failed %d", res);
+    return res;
+}
+static void CmdNextSubpass2(VkCommandBuffer cb, const VkSubpassBeginInfo *b, const VkSubpassEndInfo *e) { cbDev(cb)->CmdNextSubpass(cb, b->contents); }
+static void CmdEndRenderPass2(VkCommandBuffer cb, const VkSubpassEndInfo *e) { cbDev(cb)->CmdEndRenderPass(cb); }
 
 // ---- queues and submits ----
 typedef struct { VkQueue q; Dev *d; uint32_t family; } Q;
@@ -774,6 +789,9 @@ static PFN_vkVoidFunction deviceHook(const char *n) {
     HOOK("vkCreateBuffer", CreateBuffer);
     HOOK("vkAllocateMemory", AllocateMemory);
     HOOK("vkFreeMemory", FreeMemory);
+    HOOK("vkBindImageMemory", BindImageMemory);
+    HOOK("vkBindImageMemory2", BindImageMemory2);
+    HOOK("vkBindImageMemory2KHR", BindImageMemory2);
     HOOK("vkGetImageMemoryRequirements2", GetImageMemoryRequirements2);
     HOOK("vkGetImageMemoryRequirements2KHR", GetImageMemoryRequirements2);
     HOOK("vkGetImageMemoryRequirements", GetImageMemoryRequirements);
@@ -795,6 +813,12 @@ static PFN_vkVoidFunction deviceHook(const char *n) {
     HOOK("vkGetDeviceQueue", GetDeviceQueue);
     HOOK("vkGetDeviceQueue2", GetDeviceQueue2);
     HOOK("vkQueueSubmit", QueueSubmit);
+    HOOK("vkCreateRenderPass2", CreateRenderPass2);
+    HOOK("vkCreateRenderPass2KHR", CreateRenderPass2);
+    HOOK("vkCmdNextSubpass2", CmdNextSubpass2);
+    HOOK("vkCmdNextSubpass2KHR", CmdNextSubpass2);
+    HOOK("vkCmdEndRenderPass2", CmdEndRenderPass2);
+    HOOK("vkCmdEndRenderPass2KHR", CmdEndRenderPass2);
     return NULL;
 }
 static PFN_vkVoidFunction GetDeviceProcAddr(VkDevice dev, const char *n) {
