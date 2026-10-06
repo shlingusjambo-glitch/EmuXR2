@@ -88,6 +88,9 @@ static void present(void) {
     static __thread struct timespec last; struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
     if ((now.tv_sec - last.tv_sec) * 1000000000LL + now.tv_nsec - last.tv_nsec < 11000000) return;
     last = now;
+    // never wait on SurfaceFlinger: it in turn waits on virtual-display buffers this compositor releases
+    static __thread EGLSurface async;
+    if (async != s) { ((EGLBoolean (*)(EGLDisplay, EGLint))real("eglSwapInterval"))(eglGetCurrentDisplay(), 0); async = s; LOG("compositor surface %p: swap interval 0", s); }
     ((EGLBoolean (*)(EGLDisplay, EGLSurface))real("eglSwapBuffers"))(eglGetCurrentDisplay(), s);
 }
 static void frontBuffer(EGLSurface s) {
@@ -167,6 +170,10 @@ static void TextureStorageMem3DMS(GLuint t, GLsizei s, GLenum f, GLsizei w, GLsi
 #include <EGL/eglext.h>
 #include <pthread.h>
 #include "../vk/fdmsg.h"
+static int isDepthBuffer(AHardwareBuffer *b) {
+    AHardwareBuffer_Desc d; AHardwareBuffer_describe(b, &d);
+    return d.format >= AHARDWAREBUFFER_FORMAT_D16_UNORM && d.format <= AHARDWAREBUFFER_FORMAT_S8_UINT;
+}
 typedef struct { GLuint id; Recv rv; } MemObj;
 typedef struct { GLuint tex, mem; } TexMem;
 static MemObj mems[256]; static TexMem texs[1024];
@@ -278,7 +285,7 @@ __attribute__((visibility("default"))) void macvr_FlushArrays(void) {
         a->dirty = 0;
         for (uint32_t L = 0; L < a->layers; L++) {
             uint32_t k = L * a->mips;
-            if (k >= MAXSH || !a->buf[k]) continue;
+            if (k >= MAXSH || !a->buf[k] || isDepthBuffer(a->buf[k])) continue;
             if (!a->layerTex[L]) {   // a 2D texture over the layer's shared buffer (raw bits: linear colorspace)
                 EGLDisplay dpy = eglGetCurrentDisplay();
                 EGLClientBuffer cb = ((EGLClientBuffer (*)(const AHardwareBuffer *))gl("eglGetNativeClientBufferANDROID"))(a->buf[k]);
@@ -338,6 +345,10 @@ __attribute__((visibility("default"))) void macvr_TextureView(GLuint view, GLenu
         break;
     }
     pthread_mutex_unlock(&vlock);
+    if (buf && isDepthBuffer(buf)) {   // the host can't wrap a depth buffer as a color image (and aborts the emulator)
+        LOG("glTextureViewOES(view %u <- %u): depth/stencil buffer, not viewed", view, orig);
+        AHardwareBuffer_release(buf); return;
+    }
     if (!buf || numlayers > 1 || numlevels > 1 || (target != GL_TEXTURE_2D && target != GL_TEXTURE_2D_ARRAY)) {
         LOG("glTextureViewOES(view %u target 0x%x orig %u fmt 0x%x level %u+%u layer %u+%u): unsupported%s", view, target, orig, fmt,
             minlevel, numlevels, minlayer, numlayers, buf ? "" : " (no shared buffer)");
