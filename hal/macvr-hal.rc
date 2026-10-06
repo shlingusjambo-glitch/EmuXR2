@@ -22,3 +22,7 @@ on property:sys.boot_completed=1
     exec - system system -- /system/bin/oculuspreferences --setc first_time_nux_complete true first_time_nux_pre_ota_complete true first_time_nux_guardian_setup_complete true
     exec - system system -- /system/bin/settings put global device_provisioned 1
     exec - system system -- /system/bin/settings put secure user_setup_complete 1
+
+# Meta's telemetry daemon has nowhere to report to here and spins (over half a CPU), starving the compositor
+on property:init.svc.telemetry=running
+    stop telemetry

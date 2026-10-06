@@ -73,7 +73,16 @@ EGLSurface eglCreatePbufferSurface(EGLDisplay d, EGLConfig c, const EGLint *attr
 // window surfaces, so a switch to front-buffer rendering can turn on the window's auto-refresh: the Quest compositor
 // draws straight into the front buffer, which its display scans out; on the emulator the buffer goes through
 // SurfaceFlinger, which has to be told to show it again every vsync
-static struct { EGLSurface s; EGLNativeWindowType w; int front; } wins[32];
+static struct { EGLSurface s; EGLNativeWindowType w; int front, capture; } wins[32];
+// EmuXR2's stream: the runtime's casting capture renders both eyes into a window of the size input/Capture.java
+// announces in debug.emuxr2.capture. It isn't the display, and its frames carry the pose number they were made with.
+#include <android/native_window.h>
+#include <sys/system_properties.h>
+static int isCaptureWindow(EGLNativeWindowType w) {
+    char v[PROP_VALUE_MAX] = {0}; int cw = 0, ch = 0;
+    __system_property_get("debug.emuxr2.capture", v);
+    return sscanf(v, "%dx%d", &cw, &ch) == 2 && ANativeWindow_getWidth(w) == cw && ANativeWindow_getHeight(w) == ch;
+}
 static void hookRuntime(void);
 static int isCompositor(void) {
     static int v = -1;
@@ -107,7 +116,9 @@ EGLSurface eglCreateWindowSurface(EGLDisplay d, EGLConfig c, EGLNativeWindowType
     for (int i = 0; s != EGL_NO_SURFACE && attr && attr[i] != EGL_NONE; i += 2)
         if (attr[i] == EGL_RENDER_BUFFER && attr[i + 1] == EGL_SINGLE_BUFFER) frontBuffer(s);
     LOG("eglCreateWindowSurface(%p) -> %p (compositor %d)", w, s, isCompositor());
-    if (s != EGL_NO_SURFACE && isCompositor()) {
+    int capture = s != EGL_NO_SURFACE && isCompositor() && isCaptureWindow(w);
+    if (capture) { for (int i = 0; i < 32; i++) if (wins[i].s == s) wins[i].capture = 1; LOG("capture surface %p", s); }
+    if (s != EGL_NO_SURFACE && isCompositor() && !capture) {
         hookRuntime();
         // Meta's compositor swaps once, then keeps drawing into that buffer, which the Quest's display scans out.
         // Here the surface keeps its contents across swaps, and is presented at the compositor's fences (see present).
@@ -574,8 +585,42 @@ EGLBoolean eglSurfaceAttrib(EGLDisplay d, EGLSurface s, EGLint attr, EGLint v) {
 }
 static void dumpSwap(EGLDisplay d, EGLSurface s);
 // swaps on window surfaces (logged occasionally)
+// The pose number in effect (written by the guest's pose injector, input/Injector.java) goes into the capture's
+// bottom-left corner as 36 8x8 blocks, white = 1: sync bits 1011, then the 32-bit number, low bit first. The host
+// reads it back to tell the headset exactly which of its poses the frame shows.
+#include <fcntl.h>
+static uint32_t poseNumber(void) {
+    static volatile uint32_t *seq; static time_t tried;
+    if (!seq && time(NULL) != tried) {
+        tried = time(NULL);
+        int fd = open("/data/local/tmp/emuxr2-pose", O_RDONLY);
+        if (fd >= 0) { void *m = mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0); close(fd); if (m != MAP_FAILED) seq = m; }
+    }
+    return seq ? *seq : 0;
+}
+static void stamp(EGLDisplay d, EGLSurface s) {
+    int capture = 0;
+    for (int i = 0; i < 32; i++) if (wins[i].s == s && wins[i].capture) capture = 1;
+    if (!capture) return;
+    // the compositor thread draws this: never wait on SurfaceFlinger (which waits on this compositor's virtual displays)
+    static __thread EGLSurface async;
+    if (async != s) { ((EGLBoolean (*)(EGLDisplay, EGLint))real("eglSwapInterval"))(d, 0); async = s; LOG("capture surface %p: swap interval 0", s); }
+    uint64_t bits = 0xDull | (uint64_t)poseNumber() << 4;
+    GLboolean (*isOn)(GLenum) = gl("glIsEnabled"); void (*geti)(GLenum, GLint *) = gl("glGetIntegerv");
+    void (*getf)(GLenum, GLfloat *) = gl("glGetFloatv"); void (*getb)(GLenum, GLboolean *) = gl("glGetBooleanv");
+    void (*on)(GLenum) = gl("glEnable"), (*off)(GLenum) = gl("glDisable"), (*clear)(GLbitfield) = gl("glClear");
+    void (*scissor)(GLint, GLint, GLsizei, GLsizei) = gl("glScissor"); void (*color)(GLfloat, GLfloat, GLfloat, GLfloat) = gl("glClearColor");
+    void (*mask)(GLboolean, GLboolean, GLboolean, GLboolean) = gl("glColorMask"); void (*bindFb)(GLenum, GLuint) = gl("glBindFramebuffer");
+    GLboolean wasScissor = isOn(GL_SCISSOR_TEST), m[4]; GLint box[4], fb; GLfloat cc[4];
+    geti(GL_SCISSOR_BOX, box); getf(GL_COLOR_CLEAR_VALUE, cc); getb(GL_COLOR_WRITEMASK, m); geti(GL_DRAW_FRAMEBUFFER_BINDING, &fb);
+    bindFb(GL_DRAW_FRAMEBUFFER, 0); on(GL_SCISSOR_TEST); mask(1, 1, 1, 1);
+    for (int i = 0; i < 36; i++) { float b = (bits >> i) & 1; scissor(i * 8, 0, 8, 8); color(b, b, b, 1); clear(GL_COLOR_BUFFER_BIT); }
+    bindFb(GL_DRAW_FRAMEBUFFER, fb); (wasScissor ? on : off)(GL_SCISSOR_TEST); scissor(box[0], box[1], box[2], box[3]);
+    color(cc[0], cc[1], cc[2], cc[3]); mask(m[0], m[1], m[2], m[3]);
+}
 EGLBoolean eglSwapBuffers(EGLDisplay d, EGLSurface s) {
     static EGLBoolean (*f)(EGLDisplay, EGLSurface); if (!f) f = real("eglSwapBuffers");
+    stamp(d, s);
     dumpSwap(d, s);
     EGLBoolean r = f(d, s);
     static unsigned n; if (n < 3 || n % 500 == 0) LOG("eglSwapBuffers(%p) #%u -> %d (0x%x)", s, n, r, ((EGLint (*)(void))real("eglGetError"))()); n++;
@@ -602,6 +647,7 @@ static void dumpSwap(EGLDisplay d, EGLSurface s) {
 }
 EGLBoolean eglSwapBuffersWithDamageKHR(EGLDisplay d, EGLSurface s, EGLint *rects, EGLint n_) {
     static EGLBoolean (*f)(EGLDisplay, EGLSurface, EGLint *, EGLint); if (!f) f = real("eglSwapBuffersWithDamageKHR");
+    stamp(d, s);
     dumpSwap(d, s);
     EGLBoolean r = f(d, s, rects, n_);
     static unsigned n; if (n < 3 || n % 500 == 0) LOG("eglSwapBuffersWithDamageKHR(%p) #%u -> %d", s, n, r); n++;
