@@ -12,7 +12,7 @@ export JAVA_HOME=${JAVA_HOME:-/opt/homebrew/opt/openjdk@21}   # d8 needs it too
 JDK=$JAVA_HOME
 ANDROID_JAR=$(ls "$HOME/Library/Android/sdk/platforms/android-"*/android.jar | sort -V | tail -n 1)
 D8=$(ls -d "$HOME/Library/Android/sdk/build-tools/"*/d8 | sort -V | tail -n 1)
-for c in Injector Capture; do
+for c in Injector Capture Audio; do
     rm -rf "$HERE/out/$c" && mkdir -p "$HERE/out/$c"
     set -- "$HERE/$c.java"
     if [ "$c" = Injector ]; then set -- "$@" "$HERE/LatestPacketInput.java" "$HERE/HomeButton.java"; fi

@@ -5,3 +5,7 @@ ro.surface_flinger.has_writeback_dpu_cac=false
 debug.nux.disable_automatic_startup=1
 # ANGLE submits on a worker thread: swaps no longer stall Meta's compositor on each GPU round trip (~20% more fps)
 debug.angle.feature_overrides_enabled=asyncCommandQueue
+# eye buffers at the stream's pixel density (the 960x1080-per-eye capture covers ~80 of the eye's ~104 degrees):
+# Quest 2's 1832x1920 renders ~2x the pixels for no visible detail
+debug.oculus.textureWidth=1280
+debug.oculus.textureHeight=1344

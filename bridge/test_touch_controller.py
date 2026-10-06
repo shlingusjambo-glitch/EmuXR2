@@ -17,3 +17,13 @@ assert st.touch_controller(dict(idle, flags=0, trigger=1, buttons=16), True, men
 st.CONTROLLERS = False
 assert st.touch_controller(dict(idle, trigger=1), False, menu) == (0, 0, 0, 0, 0, 0, 0)
 print('ok')
+
+# imu_from_grip inverts the calibrated transform: IMU * GRIP_FROM_IMU gives back the grip pose
+import math, quest_proto as qp
+g = ((0.1, 1.2, -0.3), (0.0, math.sin(0.4), 0.0, math.cos(0.4)))
+(ip, iq) = st.imu_from_grip(*g)
+tp, tq = st.GRIP_FROM_IMU
+back_q = qp._quat_mul(iq, tq)
+back_p = tuple(ip[i] + qp._rot_vec(iq, tp)[i] for i in range(3))
+assert max(abs(a - b) for a, b in zip(back_p, g[0])) < 1e-6 and max(abs(a - b) for a, b in zip(back_q, g[1])) < 1e-6
+print('imu_from_grip ok')

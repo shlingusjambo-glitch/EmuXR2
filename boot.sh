@@ -28,6 +28,13 @@ f.seek(2048 * 512); f.write(v); f.close(); t = open(p + 'VerifiedBootParams.text
 open(p + 'VerifiedBootParams.textproto', 'w').write(re.sub(r'digest=[0-9a-f]+', 'digest=' + hashlib.sha256(v).hexdigest(), t))
 PY
 export ANDROID_SDK_ROOT=~/Library/Android/sdk
+# AVD tuning: the address-space graphics transport (a ring buffer; the default pipe makes every Vulkan call a
+# blocking round trip), a 72 Hz display like the Quest's, and 6 vCPUs (Meta's runtime expects big cores 4+)
+AVD=~/.android/avd/horizon.avd/config.ini
+for kv in "hw.gltransport=asg" "hw.lcd.vsync=72" "hw.cpu.ncore=6"; do
+    k=${kv%%=*}; v=${kv#*=}
+    if grep -q "^$k" "$AVD"; then sed -i '' "s/^$k.*/$k = $v/" "$AVD"; else echo "$k = $v" >> "$AVD"; fi
+done
 if [ "${FOREGROUND:-0}" = 1 ]; then
     exec ~/Library/Android/sdk/emulator/emulator -avd horizon -sysdir ~/MacVRFirmware/sysdir -no-snapshot -no-boot-anim ${WIPE-} ${HEADLESS:+-no-window} -gpu ${GPU-host} -no-metrics -crash-report-mode never -logcat "*:W" -logcat-output ~/MacVRFirmware/logcat.txt $EMUARGS
 fi

@@ -369,3 +369,26 @@ All currently actionable code/build/deployment and regression checks are complet
 - Performance: native 1920x1088 encode (no 2432x1344 upscale), ANGLE `asyncCommandQueue` (the compositor no longer
   stalls in vkResetFences on every swap), Guardian disabled (it retried spatial anchors ~15/s and leaked), 6 vCPUs,
   console logcat at W. 60 s synthetic soak after a cold boot: median pose age 70 ms, p95 92 ms (was 81/116).
+
+### Native feel: controllers, audio, brightness, environments, recovery (2026-10-06, evening)
+
+- Controllers: `bridge/calibrate_poses.py` runs the client inside the guest, injects known IMU poses and solves Horizon's
+  fixed transforms. Head: the injected pose is the eye centre (no offset); app floor 1.675 m below raw y 0. Touch:
+  grip = IMU * (60 deg about x, 3 cm down, 4 cm back). `stream.py` injects grip * that^-1; round trip in the guest:
+  0.00 cm, <0.6 deg.
+- Audio: `input/Audio.java` records the guest's mix through the remote submix (playback moves there while the host
+  listens) and serves 10 ms PCM chunks; the streamer forwards them as VR4_AUDIO. Verified end to end.
+- Brightness: Horizon's slider (`screen_brightness_for_vr`) now dims the stream (20-100 %, YUV lookup tables, ~6 ms a
+  frame only below full); the guest starts at full once.
+- Environments: only Bubbles ships in the OS; others come from the store. Environment APKs already on the owner's own
+  Quest install and appear in Settings > Environment (`systemux://settings/environment`).
+- Client: Android 12 hides `libopenxr_forwardloader.oculus.so` from apps without `<uses-native-library>`; without it the
+  Khronos loader can't reach Meta's runtime (the same for any S-targeting game).
+- Recovery: no stamped frames for 5 s restarts the capture, then the runtime, on a background thread so keepalives
+  hold the headset; the counter only resets after 30 continuous frames. A headset reset during accept no longer kills
+  the streamer.
+- Performance: asg graphics transport (ring buffer instead of a blocking pipe per Vulkan call), 72 Hz guest display,
+  eye buffers capped at 1280x1344 (`debug.oculus.textureWidth/Height`). The compositor still waits on gfxstream round
+  trips (buffer acquire, sync creation); typical stream 30-47 unique fps, pose age ~80-110 ms.
+- Meta account: blocked. Meta's servers authenticate the headset with its factory device identity certificate
+  ("Unable to load insecure device identity certificate"), which an emulator has no genuine copy of.
