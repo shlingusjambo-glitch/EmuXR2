@@ -226,7 +226,8 @@ __attribute__((visibility("default"))) void macvr_TexStorageMem2D(GLenum t, GLsi
 #include <stdatomic.h>
 #include <sys/mman.h>
 #define MAXARR 64
-typedef struct { GLuint tex; EGLContext ctx; int dirty; uint32_t layers, w, h, mips; AHardwareBuffer *buf[MAXSH]; GLuint layerTex[MAXSH];
+static int isSrgb(GLenum f) { return f == GL_SRGB8_ALPHA8 || f == GL_SRGB8 || f == 0x8FBD /* GL_SR8_EXT */; }
+typedef struct { GLuint tex; EGLContext ctx; int dirty; GLenum fmt; uint32_t layers, w, h, mips; AHardwareBuffer *buf[MAXSH]; GLuint layerTex[MAXSH];
                  volatile atomic_uint *gen; } Arr;
 static Arr arrs[MAXARR];
 static void *genWorker(void *u) {   // fd of a native fence, then the counter to bump once it signals
@@ -259,7 +260,7 @@ __attribute__((visibility("default"))) void macvr_TexStorageMem3D(GLenum t, GLsi
         for (uint32_t i = 0; i < MAXSH; i++) if (a->buf[i]) AHardwareBuffer_release(a->buf[i]);
         if (a->gen) munmap((void *)a->gen, 4096);
         memset(a, 0, sizeof *a);
-        a->tex = tex; a->ctx = eglGetCurrentContext(); a->layers = d; a->w = w; a->h = h; a->mips = mo->rv.mips ? mo->rv.mips : 1;
+        a->tex = tex; a->ctx = eglGetCurrentContext(); a->fmt = f; a->layers = d; a->w = w; a->h = h; a->mips = mo->rv.mips ? mo->rv.mips : 1;
         for (uint32_t i = 0; i < mo->rv.n && i < MAXSH; i++) { a->buf[i] = mo->rv.buf[i]; AHardwareBuffer_acquire(a->buf[i]); }
         if (mo->rv.genFd >= 0) { void *g = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, mo->rv.genFd, 0); if (g != MAP_FAILED) a->gen = g; }
         LOG("texture %u: %dx%dx%d array over %u shared layers%s", tex, w, h, d, mo->rv.n, a->gen ? "" : " (no counter)");
@@ -287,21 +288,24 @@ __attribute__((visibility("default"))) void macvr_FlushArrays(void) {
         for (uint32_t L = 0; L < a->layers; L++) {
             uint32_t k = L * a->mips;
             if (k >= MAXSH || !a->buf[k] || isDepthBuffer(a->buf[k])) continue;
-            if (!a->layerTex[L]) {   // a 2D texture over the layer's shared buffer (raw bits: linear colorspace)
+            if (!a->layerTex[L]) {   // a 2D texture over the layer's shared buffer, in the array's colorspace: copies need matching formats
                 EGLDisplay dpy = eglGetCurrentDisplay();
                 EGLClientBuffer cb = ((EGLClientBuffer (*)(const AHardwareBuffer *))gl("eglGetNativeClientBufferANDROID"))(a->buf[k]);
-                EGLint attrs[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
+                EGLint attrs[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_GL_COLORSPACE_KHR, isSrgb(a->fmt) ? EGL_GL_COLORSPACE_SRGB_KHR : EGL_GL_COLORSPACE_LINEAR_KHR, EGL_NONE};
                 EGLImageKHR img = ((EGLImageKHR (*)(EGLDisplay, EGLContext, EGLenum, EGLClientBuffer, const EGLint *))real("eglCreateImageKHR"))(dpy, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, cb, attrs);
                 if (img == EGL_NO_IMAGE_KHR) { LOG("texture %u layer %u: no image", a->tex, L); continue; }
                 GLint prev = boundTex(GL_TEXTURE_2D);
                 ((void (*)(GLsizei, GLuint *))gl("glGenTextures"))(1, &a->layerTex[L]);
                 ((void (*)(GLenum, GLuint))gl("glBindTexture"))(GL_TEXTURE_2D, a->layerTex[L]);
                 ((void (*)(GLenum, GLeglImageOES))gl("glEGLImageTargetTexture2DOES"))(GL_TEXTURE_2D, img);
+                // one level: a mipmapped min filter would leave it incomplete, and ANGLE refuses to copy into it
+                ((void (*)(GLenum, GLenum, GLint))gl("glTexParameteri"))(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
                 ((void (*)(GLenum, GLuint))gl("glBindTexture"))(GL_TEXTURE_2D, prev);
                 ((EGLBoolean (*)(EGLDisplay, EGLImageKHR))real("eglDestroyImageKHR"))(dpy, img);
             }
             ((void (*)(GLuint, GLenum, GLint, GLint, GLint, GLint, GLuint, GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei))gl("glCopyImageSubDataEXT"))(
                 a->tex, GL_TEXTURE_2D_ARRAY, 0, 0, 0, L, a->layerTex[L], GL_TEXTURE_2D, 0, 0, 0, 0, a->w, a->h, 1);
+            { static int n; GLenum e = ((GLenum (*)(void))gl("glGetError"))(); if (e && n++ < 4) LOG("texture %u layer %u copy (format 0x%x): GL error 0x%x", a->tex, L, a->fmt, e); }
         }
         if (a->gen && j.n < MAXARR) j.gen[j.n++] = a->gen;
     }
@@ -333,7 +337,6 @@ EGLSync eglCreateSync(EGLDisplay d, EGLenum type, const EGLAttrib *attr) {
     macvr_FlushArrays();
     return f(d, type, attr);
 }
-static int isSrgb(GLenum f) { return f == GL_SRGB8_ALPHA8 || f == GL_SRGB8 || f == 0x8FBD /* GL_SR8_EXT */; }
 __attribute__((visibility("default"))) void macvr_TextureView(GLuint view, GLenum target, GLuint orig, GLenum fmt, GLuint minlevel, GLuint numlevels, GLuint minlayer, GLuint numlayers) {
     AHardwareBuffer *buf = NULL;
     pthread_mutex_lock(&vlock);
@@ -534,7 +537,9 @@ EGLBoolean eglSwapBuffersWithDamageKHR(EGLDisplay, EGLSurface, EGLint *, EGLint)
 __eglMustCastToProperFunctionPointerType eglGetProcAddress(const char *name) {
     static __eglMustCastToProperFunctionPointerType (*f)(const char *);
     if (!f) f = real("eglGetProcAddress");
-    if (!strcmp(name, "glShaderSource") || !strcmp(name, "glCompileShader") || !strcmp(name, "glGetActiveUniformBlockiv") || !strcmp(name, "glValidateProgram") || !strcmp(name, "glLinkProgram") || !strcmp(name, "glProgramBinary")) {
+    if (!strcmp(name, "glShaderSource") || !strcmp(name, "glCompileShader") || !strcmp(name, "glGetActiveUniformBlockiv") || !strcmp(name, "glValidateProgram") || !strcmp(name, "glLinkProgram") || !strcmp(name, "glProgramBinary") ||
+        !strcmp(name, "glFramebufferTextureMultiviewOVR") || !strcmp(name, "glFramebufferTextureMultisampleMultiviewOVR") ||
+        !strcmp(name, "glBindFramebuffer") || !strcmp(name, "glFenceSync")) {
         void *shim = dlopen("libGLESv2_macvr.so", RTLD_NOW | RTLD_NOLOAD);
         void *entry = shim ? dlsym(shim, name) : NULL;
         if (entry) return (__eglMustCastToProperFunctionPointerType)entry;

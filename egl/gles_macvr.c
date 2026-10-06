@@ -137,27 +137,43 @@ void glValidateProgram(GLuint program) {
     }
 }
 
-// GL_OES_texture_view is emulated (in egl_macvr.c) for Meta VR clients, which use it to wrap shared swapchains
+// GL_OES_texture_view is emulated (in egl_macvr.c) for Meta VR clients, which use it to wrap shared swapchains:
+// Meta's own processes, and any VR app (Meta's vrapi/OpenXR runtime runs inside it). Android's EGL loader caches
+// the extension string at the context's first eglMakeCurrent, often before the game loads vrapi, so this goes by
+// the process: its mapped libraries, or the VR runtime libraries shipped in its native library directory.
 static int wantsViews(void) {
-    static int v = -1;
-    if (v < 0) { char n[64] = {0}; FILE *f = fopen("/proc/self/cmdline", "r"); if (f) { fread(n, 1, 63, f); fclose(f); } v = !strncmp(n, "com.oculus.", 11); }
+    static int v;
+    if (v) return 1;
+    char n[64] = {0}; FILE *f = fopen("/proc/self/cmdline", "r"); if (f) { fread(n, 1, 63, f); fclose(f); }
+    if (!strncmp(n, "com.oculus.", 11)) return v = 1;
+    static const char *vr[] = {"libvrapi.so", "libopenxr_loader.so", "libOVRPlugin.so"};
+    char line[512], dir[512] = "";
+    if (!(f = fopen("/proc/self/maps", "r"))) return 0;
+    while (!v && fgets(line, sizeof line, f)) {
+        for (unsigned i = 0; i < sizeof vr / sizeof *vr; i++) if (strstr(line, vr[i])) v = 1;
+        char *p = strstr(line, "/data/app/"), *l = p ? strstr(p, "/lib/") : NULL;
+        if (l && !*dir) { char *e = strchr(l + 5, '/'); if (e) snprintf(dir, sizeof dir, "%.*s", (int)(e - p), p); }
+    }
+    fclose(f);
+    for (unsigned i = 0; !v && *dir && i < sizeof vr / sizeof *vr; i++) { char path[600]; snprintf(path, sizeof path, "%s/%s", dir, vr[i]); v = !access(path, F_OK); }
     return v;
 }
 static const char *hidden[] = {"GL_EXT_texture_view"};
 const GLubyte *glGetString(GLenum name) {
     static const GLubyte *(*f)(GLenum);
-    static __thread char *cache; static __thread const GLubyte *src;
+    static __thread char *cache[2]; static __thread const GLubyte *src[2];
     if (!f) f = dlsym(RTLD_NEXT, "glGetString");
     const GLubyte *s = f(name);
     if (name != GL_EXTENSIONS || !s) return s;
-    if (s == src && cache) return (const GLubyte *)cache;
-    free(cache); cache = malloc(strlen((const char *)s) + 32); strcpy(cache, (const char *)s); src = s;
-    if (wantsViews() && !strstr(cache, "GL_OES_texture_view")) { strcat(cache, " GL_OES_texture_view"); LOG("advertising GL_OES_texture_view"); }
+    int views = wantsViews();
+    if (s == src[views] && cache[views]) return (const GLubyte *)cache[views];
+    free(cache[views]); char *c = cache[views] = malloc(strlen((const char *)s) + 32); strcpy(c, (const char *)s); src[views] = s;
+    if (views && !strstr(c, "GL_OES_texture_view")) { strcat(c, " GL_OES_texture_view"); LOG("advertising GL_OES_texture_view"); }
     for (unsigned i = 0; i < sizeof hidden / sizeof *hidden; i++) {
-        char *p = strstr(cache, hidden[i]);
+        char *p = strstr(c, hidden[i]);
         if (p) { size_t n = strlen(hidden[i]); memmove(p, p + n + (p[n] == ' '), strlen(p + n + (p[n] == ' ')) + 1); LOG("hiding %s", hidden[i]); }
     }
-    return (const GLubyte *)cache;
+    return (const GLubyte *)c;
 }
 const GLubyte *glGetStringi(GLenum name, GLuint index) {
     static const GLubyte *(*f)(GLenum, GLuint);
@@ -285,10 +301,26 @@ GLenum glCheckFramebufferStatus(GLenum target) {
 }
 
 // framebuffer attachments: arrays emulated in libEGL_macvr need copying out once rendered (and failures are logged)
+// Apps that attach once and then rebind the framebuffer every frame (Unity) re-dirty the array on each draw binding.
 static void noteAttach(GLuint tex) { static void (*f)(GLuint); if (!f) f = eglShim("macvr_NoteAttach"); if (f) f(tex); }
+#define MAXFB 64
+static struct { GLuint fb, tex; } fbTex[MAXFB];   // draw framebuffer -> colour texture attached to it
+static void rememberAttach(GLenum target, GLenum att, GLuint tex) {
+    if (target == GL_READ_FRAMEBUFFER || att != GL_COLOR_ATTACHMENT0) return;
+    GLint fb = 0; glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fb);
+    if (!fb) return;
+    int slot = -1;
+    for (int i = 0; i < MAXFB; i++) { if (fbTex[i].fb == (GLuint)fb) { slot = i; break; } if (slot < 0 && !fbTex[i].fb) slot = i; }
+    if (slot >= 0) { fbTex[slot].fb = fb; fbTex[slot].tex = tex; }
+}
+void glBindFramebuffer(GLenum target, GLuint fb) {
+    static void (*f)(GLenum, GLuint); if (!f) f = dlsym(RTLD_NEXT, "glBindFramebuffer");
+    f(target, fb);
+    if (fb && target != GL_READ_FRAMEBUFFER) for (int i = 0; i < MAXFB; i++) if (fbTex[i].fb == fb) { if (fbTex[i].tex) noteAttach(fbTex[i].tex); break; }
+}
 #define ATTACH(name, params, args, tex, fmt, ...) void name params { static void (*f) params; static GLenum (*err)(void); \
     if (!f) { f = dlsym(RTLD_NEXT, #name); err = dlsym(RTLD_NEXT, "glGetError"); } \
-    noteAttach(tex); if (!f) { LOG(#name ": not in the driver"); return; } f args; GLenum e = err(); if (e) LOG(#name fmt ": GL error 0x%x", __VA_ARGS__, e); }
+    noteAttach(tex); rememberAttach(t, a, tex); if (!f) { LOG(#name ": not in the driver"); return; } f args; GLenum e = err(); if (e) LOG(#name fmt ": GL error 0x%x", __VA_ARGS__, e); }
 ATTACH(glFramebufferTexture2D, (GLenum t, GLenum a, GLenum tt, GLuint tex, GLint l), (t, a, tt, tex, l), tex, "(0x%x, 0x%x, tex %u)", a, tt, tex)
 ATTACH(glFramebufferTextureLayer, (GLenum t, GLenum a, GLuint tex, GLint l, GLint layer), (t, a, tex, l, layer), tex, "(0x%x, tex %u, layer %d)", a, tex, layer)
 ATTACH(glFramebufferTextureMultiviewOVR, (GLenum t, GLenum a, GLuint tex, GLint l, GLint base, GLsizei n), (t, a, tex, l, base, n), tex, "(0x%x, tex %u, views %d+%d)", a, tex, base, n)
