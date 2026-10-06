@@ -7,3 +7,4 @@ hal/lib/
 *.cil
 .DS_Store
 __pycache__/
+input/out/

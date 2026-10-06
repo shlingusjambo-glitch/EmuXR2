@@ -110,6 +110,17 @@ static VkFormat ahbFormat(VkFormat f) {
     return f == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM : f == VK_FORMAT_B8G8R8A8_SRGB ? VK_FORMAT_B8G8R8A8_UNORM : f;
 }
 
+static VkImageAspectFlags formatAspect(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_D16_UNORM: case VK_FORMAT_X8_D24_UNORM_PACK32: case VK_FORMAT_D32_SFLOAT:
+        return VK_IMAGE_ASPECT_DEPTH_BIT;
+    case VK_FORMAT_S8_UINT: return VK_IMAGE_ASPECT_STENCIL_BIT;
+    case VK_FORMAT_D16_UNORM_S8_UINT: case VK_FORMAT_D24_UNORM_S8_UINT: case VK_FORMAT_D32_SFLOAT_S8_UINT:
+        return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+    default: return VK_IMAGE_ASPECT_COLOR_BIT;
+    }
+}
+
 #include "fdmsg.h"
 
 // ---- shadows and copies ----
@@ -119,7 +130,8 @@ static VkResult makeShadow(Shared *s, uint32_t i, AHardwareBuffer *import, AHard
     VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, &ext, 0, VK_IMAGE_TYPE_2D, ahbFormat(s->ci.format),
         {s->ci.extent.width >> mip ? s->ci.extent.width >> mip : 1, s->ci.extent.height >> mip ? s->ci.extent.height >> mip : 1, 1},
         1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
-        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+            (formatAspect(s->ci.format) == VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT),
         VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
     VkResult r = d->CreateImage(s->dev, &ci, NULL, &s->sh[i]);
     if (r) return r;
@@ -135,7 +147,12 @@ static VkResult makeShadow(Shared *s, uint32_t i, AHardwareBuffer *import, AHard
         VkMemoryRequirements mr; d->GetImageMemoryRequirements(s->dev, s->sh[i], &mr);
         ded.pNext = &ex; ai.allocationSize = mr.size; ai.memoryTypeIndex = pickType(d, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     }
-    if ((r = d->AllocateMemory(s->dev, &ai, NULL, &s->shm[i]))) return r;
+    if ((r = d->AllocateMemory(s->dev, &ai, NULL, &s->shm[i]))) {
+        // A failed driver allocation does not own a memory object, even if the
+        // guest transport wrote a nonzero handle into its output slot.
+        s->shm[i] = VK_NULL_HANDLE;
+        return r;
+    }
     if ((r = d->BindImageMemory(s->dev, s->sh[i], s->shm[i], 0))) return r;
     if (exported) {
         VkMemoryGetAndroidHardwareBufferInfoANDROID gi = {VK_STRUCTURE_TYPE_MEMORY_GET_ANDROID_HARDWARE_BUFFER_INFO_ANDROID, NULL, s->shm[i]};
@@ -161,15 +178,17 @@ static VkCommandBuffer copyCmd(Shared *s, uint32_t family, int toImage) {
     d->BeginCommandBuffer(cb, &bi);
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
     d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
-    VkImageAspectFlags asp = VK_IMAGE_ASPECT_COLOR_BIT;
     for (uint32_t i = 0; i < s->n; i++) {
         uint32_t layer = i / s->ci.mipLevels, mip = i % s->ci.mipLevels;
         VkExtent3D e = {s->ci.extent.width >> mip ? s->ci.extent.width >> mip : 1, s->ci.extent.height >> mip ? s->ci.extent.height >> mip : 1, 1};
-        VkImageCopy c = {{asp, mip, layer, 1}, {0, 0, 0}, {asp, 0, 0, 1}, {0, 0, 0}, e};
-        if (toImage) {   // shadows -> image
-            VkImageCopy b = {{asp, 0, 0, 1}, {0, 0, 0}, {asp, mip, layer, 1}, {0, 0, 0}, e};
-            d->CmdCopyImage(cb, s->sh[i], VK_IMAGE_LAYOUT_GENERAL, s->image, VK_IMAGE_LAYOUT_GENERAL, 1, &b);
-        } else d->CmdCopyImage(cb, s->image, VK_IMAGE_LAYOUT_GENERAL, s->sh[i], VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+        for (VkImageAspectFlags asp = VK_IMAGE_ASPECT_COLOR_BIT; asp <= VK_IMAGE_ASPECT_STENCIL_BIT; asp <<= 1) {
+            if (!(formatAspect(s->ci.format) & asp)) continue;
+            VkImageCopy c = {{asp, mip, layer, 1}, {0, 0, 0}, {asp, 0, 0, 1}, {0, 0, 0}, e};
+            if (toImage) {   // shadows -> image
+                VkImageCopy b = {{asp, 0, 0, 1}, {0, 0, 0}, {asp, mip, layer, 1}, {0, 0, 0}, e};
+                d->CmdCopyImage(cb, s->sh[i], VK_IMAGE_LAYOUT_GENERAL, s->image, VK_IMAGE_LAYOUT_GENERAL, 1, &b);
+            } else d->CmdCopyImage(cb, s->image, VK_IMAGE_LAYOUT_GENERAL, s->sh[i], VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+        }
     }
     VkMemoryBarrier mb2 = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
     d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb2, 0, NULL, 0, NULL);
@@ -562,7 +581,13 @@ static VkResult AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *ai, con
         ftruncate(s->genFd, 4096);
         s->gen = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, s->genFd, 0);
         for (uint32_t i = 0; i < s->n; i++)
-            if ((r = makeShadow(s, i, NULL, NULL))) { LOG("export: shadow %u failed %d", i, r); d->FreeMemory(dev, *out, a); s->mem = NULL; return r; }
+            if ((r = makeShadow(s, i, NULL, NULL))) {
+                LOG("export: shadow %u failed %d", i, r);
+                d->FreeMemory(dev, *out, a);
+                s->mem = VK_NULL_HANDLE;
+                *out = VK_NULL_HANDLE;
+                return r;
+            }
         s->ready = 1;
         LOG("export %p: %u shadows", (void *)s->image, s->n);
         return VK_SUCCESS;

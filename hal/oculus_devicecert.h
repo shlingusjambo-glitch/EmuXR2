@@ -5,7 +5,11 @@ namespace vendor::oculus::hardware::devicecert::V1_0 {
 using ::android::hardware::Return;
 using ::android::hardware::hidl_string;
 using ::android::hardware::hidl_vec;
-enum class Result : uint32_t { OK = 0, ERROR = 1 };
+// Values from the firmware's generated Result.java declarations.
+enum class Result : uint32_t {
+    OK = 0, FILESYSTEM_ERROR = 1, INVALID_STATE = 4,
+    UNSUPPORTED_COMMAND = 0x66
+};
 struct IDeviceCert : public ::android::hidl::base::V1_0::IBase {
     static const char *descriptor;
     using BoolCallback = std::function<void(Result, bool)>;

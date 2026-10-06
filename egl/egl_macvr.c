@@ -13,6 +13,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <sys/system_properties.h>
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "MacVR-EGL", __VA_ARGS__)
 
 static void *real(const char *n) { return dlsym(RTLD_NEXT, n); }
@@ -375,6 +376,157 @@ __attribute__((visibility("default"))) void macvr_TextureView(GLuint view, GLenu
     ((EGLBoolean (*)(EGLDisplay, EGLImageKHR))real("eglDestroyImageKHR"))(dpy, img);
 }
 
+// Opt-in readback of Android surface imports, before the compositor samples them.
+// Use a writable /data/local/tmp and set debug.macvr.dumpexternal=1.
+void macvr_ImageTargetTexture2D(GLenum target, GLeglImageOES image) {
+    static void (*bindImage)(GLenum, GLeglImageOES);
+    if (!bindImage) {
+        void *driver = dlopen("libGLESv2_angle.so", RTLD_NOW | RTLD_NOLOAD);
+        bindImage = driver ? dlsym(driver, "glEGLImageTargetTexture2DOES") : NULL;
+    }
+    if (!bindImage) { LOG("external image entry point unavailable"); return; }
+    bindImage(target, image);
+    char enabled[PROP_VALUE_MAX] = {0};
+    __system_property_get("debug.macvr.dumpexternal", enabled);
+    if (!isCompositor() || strcmp(enabled, "1")) return;
+    static unsigned count;
+    if (count >= 12) return;
+    GLint oldTex, oldRead, oldDraw, w = 0, h = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldTex);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &oldRead);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &oldDraw);
+    GLuint tex, fb;
+    glGenTextures(1, &tex); glBindTexture(GL_TEXTURE_2D, tex);
+    bindImage(GL_TEXTURE_2D, image);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+    glGenFramebuffers(1, &fb); glBindFramebuffer(GL_READ_FRAMEBUFFER, fb);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    GLenum status = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+    if (w > 0 && h > 0 && w <= 4096 && h <= 4096 && status == GL_FRAMEBUFFER_COMPLETE) {
+        size_t size = (size_t)w * h * 4;
+        void *pixels = malloc(size);
+        if (pixels) {
+            glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+            char path[160];
+            snprintf(path, sizeof path, "/data/local/tmp/external-%d-%u-%dx%d.rgba", getpid(), count, w, h);
+            FILE *file = fopen(path, "wb");
+            if (file) { fwrite(pixels, 1, size, file); fclose(file); }
+            free(pixels);
+        }
+    }
+    GLint sampler = 0, min = 0, wrap = 0;
+    glGetIntegerv(GL_SAMPLER_BINDING, &sampler);
+    if (sampler) {
+        glGetSamplerParameteriv(sampler, GL_TEXTURE_MIN_FILTER, &min);
+        glGetSamplerParameteriv(sampler, GL_TEXTURE_WRAP_S, &wrap);
+    }
+    LOG("external readback #%u: target 0x%x %dx%d framebuffer 0x%x sampler %d min 0x%x wrap 0x%x", count++, target, w, h, status, sampler, min, wrap);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, oldRead); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, oldDraw);
+    glBindTexture(GL_TEXTURE_2D, oldTex);
+    glDeleteFramebuffers(1, &fb); glDeleteTextures(1, &tex);
+}
+
+void macvr_ExternalSamplers(void) {
+    if (!isCompositor()) return;
+    char enabled[PROP_VALUE_MAX] = {0};
+    __system_property_get("debug.macvr.dumpexternal", enabled);
+    if (strcmp(enabled, "1")) return;
+    static unsigned count;
+    GLint currentProgram = 0, activeUniforms = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &currentProgram);
+    glGetProgramiv(currentProgram, GL_ACTIVE_UNIFORMS, &activeUniforms);
+    int usesExternal = 0;
+    for (GLint i = 0; i < activeUniforms; i++) {
+        char name[256]; GLint size; GLenum type;
+        glGetActiveUniform(currentProgram, i, sizeof name, NULL, &size, &type, name);
+        if (type == GL_SAMPLER_EXTERNAL_OES) usesExternal = 1;
+    }
+    if (!usesExternal) return;
+    if (count >= 20) return;
+    GLint active;
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+    for (int unit = 0; unit < 8; unit++) {
+        GLint tex = 0, sampler = 0, min = 0, wrapS = 0, wrapT = 0;
+        glActiveTexture(GL_TEXTURE0 + unit);
+        glGetIntegerv(GL_TEXTURE_BINDING_EXTERNAL_OES, &tex);
+        if (!tex) continue;
+        GLint program = 0;
+        glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+        static GLuint dumped[20]; static unsigned ndumped;
+        int seen = 0;
+        for (unsigned i = 0; i < ndumped; i++) if (dumped[i] == (GLuint)program) seen = 1;
+        if (!seen && ndumped < 20) {
+            dumped[ndumped++] = program;
+            GLuint shaders[8]; GLsizei nshader = 0;
+            glGetAttachedShaders(program, 8, &nshader, shaders);
+            for (GLsizei i = 0; i < nshader; i++) {
+                GLint length = 0, type = 0;
+                glGetShaderiv(shaders[i], GL_SHADER_SOURCE_LENGTH, &length);
+                glGetShaderiv(shaders[i], GL_SHADER_TYPE, &type);
+                if (length > 0 && length < 1048576) {
+                    char *source = malloc(length), path[160];
+                    if (source) {
+                        glGetShaderSource(shaders[i], length, NULL, source);
+                        snprintf(path, sizeof path, "/data/local/tmp/program-%d-%d-%x.glsl", getpid(), program, type);
+                        FILE *file = fopen(path, "w");
+                        if (file) { fputs(source, file); fclose(file); }
+                        free(source);
+                    }
+                }
+            }
+            GLint nuniform = 0;
+            glGetProgramiv(program, GL_ACTIVE_UNIFORMS, &nuniform);
+            for (GLint i = 0; i < nuniform; i++) {
+                char name[256]; GLint size; GLenum type;
+                glGetActiveUniform(program, i, sizeof name, NULL, &size, &type, name);
+                if (type == GL_SAMPLER_2D || type == GL_SAMPLER_EXTERNAL_OES || type == GL_SAMPLER_2D_ARRAY) {
+                    GLint location = glGetUniformLocation(program, name), value = -1;
+                    if (location >= 0) glGetUniformiv(program, location, &value);
+                    GLenum error = glGetError();
+                    GLint direct = -1;
+                    void *driver = dlopen("libGLESv2_angle.so", RTLD_NOW | RTLD_NOLOAD);
+                    void (*query)(GLuint, GLint, GLint *) = driver ? dlsym(driver, "glGetUniformiv") : NULL;
+                    if (query && location >= 0) query(program, location, &direct);
+                    LOG("program %d sampler %s type 0x%x location %d unit %d direct %d query error 0x%x", program, name, type, location, value, direct, error);
+                }
+            }
+        }
+        glGetIntegerv(GL_SAMPLER_BINDING, &sampler);
+        if (sampler) {
+            glGetSamplerParameteriv(sampler, GL_TEXTURE_MIN_FILTER, &min);
+            glGetSamplerParameteriv(sampler, GL_TEXTURE_WRAP_S, &wrapS);
+            glGetSamplerParameteriv(sampler, GL_TEXTURE_WRAP_T, &wrapT);
+        } else {
+            glGetTexParameteriv(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, &min);
+            glGetTexParameteriv(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, &wrapS);
+            glGetTexParameteriv(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, &wrapT);
+        }
+        LOG("external draw #%u unit %d texture %d sampler %d min 0x%x wrap 0x%x/0x%x", count++, unit, tex, sampler, min, wrapS, wrapT);
+    }
+    glActiveTexture(active);
+}
+
+
+void macvr_ExternalDrawResult(void) {
+    if (!isCompositor()) return;
+    char enabled[PROP_VALUE_MAX] = {0};
+    __system_property_get("debug.macvr.dumpexternal", enabled);
+    static unsigned count;
+    if (strcmp(enabled, "1") || count >= 20) return;
+    GLint program = 0, nuniform = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+    glGetProgramiv(program, GL_ACTIVE_UNIFORMS, &nuniform);
+    for (GLint i = 0; i < nuniform; i++) {
+        char name[256]; GLint size; GLenum type;
+        glGetActiveUniform(program, i, sizeof name, NULL, &size, &type, name);
+        if (type == GL_SAMPLER_EXTERNAL_OES) {
+            LOG("external program %d draw result #%u error 0x%x", program, count++, glGetError());
+            return;
+        }
+    }
+}
+
 // the platform loader resolves extension entry points through the driver's eglGetProcAddress
 EGLBoolean eglSurfaceAttrib(EGLDisplay, EGLSurface, EGLint, EGLint);
 EGLBoolean eglSwapBuffers(EGLDisplay, EGLSurface);
@@ -382,6 +534,12 @@ EGLBoolean eglSwapBuffersWithDamageKHR(EGLDisplay, EGLSurface, EGLint *, EGLint)
 __eglMustCastToProperFunctionPointerType eglGetProcAddress(const char *name) {
     static __eglMustCastToProperFunctionPointerType (*f)(const char *);
     if (!f) f = real("eglGetProcAddress");
+    if (!strcmp(name, "glShaderSource") || !strcmp(name, "glCompileShader") || !strcmp(name, "glGetActiveUniformBlockiv") || !strcmp(name, "glValidateProgram") || !strcmp(name, "glLinkProgram") || !strcmp(name, "glProgramBinary")) {
+        void *shim = dlopen("libGLESv2_macvr.so", RTLD_NOW | RTLD_NOLOAD);
+        void *entry = shim ? dlsym(shim, name) : NULL;
+        if (entry) return (__eglMustCastToProperFunctionPointerType)entry;
+    }
+    if (!strcmp(name, "glEGLImageTargetTexture2DOES")) return (__eglMustCastToProperFunctionPointerType)macvr_ImageTargetTexture2D;
     if (!strcmp(name, "eglCreateContext")) return (__eglMustCastToProperFunctionPointerType)eglCreateContext;
     if (!strcmp(name, "eglCreatePbufferSurface")) return (__eglMustCastToProperFunctionPointerType)eglCreatePbufferSurface;
     if (!strcmp(name, "eglCreateWindowSurface")) return (__eglMustCastToProperFunctionPointerType)eglCreateWindowSurface;

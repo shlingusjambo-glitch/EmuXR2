@@ -1,0 +1,212 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>EmuXR · Desktop control</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#101319;color:#edf1f6}*{box-sizing:border-box}body{margin:0}header{padding:18px 26px;display:flex;align-items:center;gap:15px;border-bottom:1px solid #29303c}h1{font-size:19px;margin:0;letter-spacing:-.4px}.dot{width:8px;height:8px;border-radius:50%;background:#83d6ac}#status{color:#a2aebb;font-size:12px;margin-left:auto}main{display:grid;grid-template-columns:minmax(280px,1fr) 270px;gap:22px;max-width:1250px;margin:auto;padding:24px}.screen{display:flex;justify-content:center;align-items:center;background:#07090d;border:1px solid #2d3542;border-radius:16px;overflow:hidden;min-height:440px;height:calc(100vh - 132px)}#display{max-width:100%;max-height:100%;object-fit:contain;outline:none;user-select:none;touch-action:none}.screen.active{border-color:#82b6ff;box-shadow:0 0 0 2px #82b6ff24}aside{padding-top:6px}h2{font-size:13px;text-transform:uppercase;letter-spacing:1.4px;color:#a2aebb;margin:0 0 16px}p{font-size:13px;line-height:1.6;color:#a2aebb}button,select{font:inherit;border:1px solid #3b4556;border-radius:9px;background:#202733;color:#edf1f6;padding:11px;cursor:pointer}button:hover{background:#303d50}.primary{background:#5284d8;color:white;border-color:#5284d8;width:100%;font-weight:600}.primary:hover{background:#6597eb}.row{display:flex;gap:8px;margin:10px 0}.row>*{flex:1}label{font-size:13px;display:block;margin:22px 0 8px}input[type=range]{width:100%;accent-color:#82b6ff}.hint{padding:12px;background:#191f29;border-radius:10px}kbd{font:11px system-ui;border:1px solid #465268;border-radius:4px;padding:2px 5px;color:#eef2fa}#angles{font-size:12px;color:#8191a7}#error{color:#ffb1b1;min-height:18px;font-size:12px}@media(max-width:760px){main{grid-template-columns:1fr;padding:12px}.screen{height:65vh;min-height:300px}aside{padding:10px}}
+</style><header><span class="dot"></span><h1>EmuXR</h1><span id="status">Connecting…</span></header>
+<main><div class="screen" id="screen"><canvas id="display" tabindex="0" aria-label="Live emulator display" width="720" height="810"></canvas></div><aside><h2>Desktop control</h2><button id="capture" class="primary">Focus keyboard</button><p id="instructions">Point and click on the display. Two-finger scroll works over the display. Click it to type.</p><div class="row"><select id="mode" aria-label="Control mode"><option value="mouse">Mouse & keyboard</option><option value="look">Turn head</option></select><button id="reset">Center head</button></div><div class="row"><button data-look="left" aria-label="Look left">←</button><button data-look="up" aria-label="Look up">↑</button><button data-look="down" aria-label="Look down">↓</button><button data-look="right" aria-label="Look right">→</button></div><p class="hint">In mouse mode, hold the right mouse button and drag to look around. Two-finger scroll scrolls the panel. In head mode, move over the display to look; switch back to click.</p><div class="row"><button id="escape">Send Esc</button></div><label for="lookSpeed">Head sensitivity</label><input id="lookSpeed" type="range" min=".001" max=".012" step=".001" value=".004"><p id="angles">Head centered</p><div id="error" role="alert"></div></aside></main>
+<script>
+const token='__TOKEN__', img=document.querySelector('#display'), screenBox=document.querySelector('#screen'), mode=document.querySelector('#mode');
+let yaw=0,pitch=0,right=false,queue=[],posePending=false,sending=false,lastPoint=null,pendingPoint=null,wheel=0;
+const context=img.getContext('2d',{alpha:false});let displayed=0,videoDrops=0,ws;
+let decoder=null;
+function startMjpegFallback(msg){
+  console.warn('Falling back to MJPEG stream:', msg);
+  document.querySelector('#error').textContent = '';
+  // Replace canvas display with an image element or draw image onto canvas
+  const mjpegImg = new Image();
+  mjpegImg.crossOrigin = 'anonymous';
+  mjpegImg.src = '/stream.mjpeg?token=' + token;
+  mjpegImg.onload = () => {
+    // MJPEG multipart feeds frame by frame
+  };
+  // Render MJPEG frames onto the existing canvas for point-and-click / sizing compatibility
+  function drawMjpegLoop(){
+    if (mjpegImg.complete && mjpegImg.naturalWidth > 0) {
+      context.drawImage(mjpegImg, 0, 0, 720, 810);
+      displayed++;
+    }
+    requestAnimationFrame(drawMjpegLoop);
+  }
+  requestAnimationFrame(drawMjpegLoop);
+}
+
+if(typeof VideoDecoder === 'undefined'){
+  startMjpegFallback('WebCodecs not supported');
+} else {
+  try {
+    decoder=new VideoDecoder({
+      output: frame => {
+        context.drawImage(frame, 0, 0, 720, 810);
+        frame.close();
+        displayed++;
+      },
+      error: e => {
+        console.error('VideoDecoder error', e);
+        startMjpegFallback(e.message);
+      }
+    });
+    decoder.configure({codec:'vp8', codedWidth:720, codedHeight:810, optimizeForLatency:true});
+    connectVideo();
+  } catch(e) {
+    console.error('VideoDecoder configure failed', e);
+    startMjpegFallback(e.message);
+  }
+}
+
+function connectVideo(){
+  ws=new WebSocket('ws://'+location.host+'/video?token='+token);
+  ws.binaryType='arraybuffer';
+  ws.onerror=e=>{
+    console.error('WS error',e);
+    startMjpegFallback('WS error');
+  };
+  ws.onopen=()=>{console.log('WS connected');document.querySelector('#error').textContent='';};
+  ws.onmessage=e=>{
+    if(!decoder)return;
+    try {
+      const d=new DataView(e.data),key=d.getUint8(0)===1;
+      decoder.decode(new EncodedVideoChunk({type:key?'key':'delta',timestamp:Number(d.getBigUint64(1)),data:new Uint8Array(e.data,9)}));
+    } catch(err) {
+      console.error('Decode error',err);
+      startMjpegFallback(err.message);
+    }
+  };
+  ws.onclose=e=>{
+    console.warn('WS closed',e);
+  };
+}
+const keys={Escape:1,Digit1:2,Digit2:3,Digit3:4,Digit4:5,Digit5:6,Digit6:7,Digit7:8,Digit8:9,Digit9:10,Digit0:11,Minus:12,Equal:13,Backspace:14,Tab:15,KeyQ:16,KeyW:17,KeyE:18,KeyR:19,KeyT:20,KeyY:21,KeyU:22,KeyI:23,KeyO:24,KeyP:25,BracketLeft:26,BracketRight:27,Enter:28,ControlLeft:29,KeyA:30,KeyS:31,KeyD:32,KeyF:33,KeyG:34,KeyH:35,KeyJ:36,KeyK:37,KeyL:38,Semicolon:39,Quote:40,Backquote:41,ShiftLeft:42,Backslash:43,KeyZ:44,KeyX:45,KeyC:46,KeyV:47,KeyB:48,KeyN:49,KeyM:50,Comma:51,Period:52,Slash:53,ShiftRight:54,NumpadMultiply:55,AltLeft:56,Space:57,CapsLock:58,F1:59,F2:60,F3:61,F4:62,F5:63,F6:64,F7:65,F8:66,F9:67,F10:68,NumLock:69,ScrollLock:70,F11:87,F12:88,NumpadEnter:96,ControlRight:97,NumpadDivide:98,AltRight:100,Home:102,ArrowUp:103,PageUp:104,ArrowLeft:105,ArrowRight:106,End:107,ArrowDown:108,PageDown:109,Insert:110,Delete:111,MetaLeft:125,MetaRight:126};
+let chain=Promise.resolve();
+function post(path,body){const task=chain.then(async()=>{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-Control-Token':token},body:JSON.stringify(body)});if(!r.ok)throw Error((await r.json()).error||'Connection failed');document.querySelector('#error').textContent='';});chain=task.catch(e=>document.querySelector('#error').textContent=e.message);return chain;}
+
+function lockPointer(){
+  if(document.pointerLockElement!==img){
+    img.requestPointerLock?.();
+  }
+  img.focus();
+}
+
+document.querySelector('#capture').onclick=lockPointer;
+img.addEventListener('click',lockPointer);
+
+document.addEventListener('pointerlockchange',()=>{
+  const locked=document.pointerLockElement===img;
+  screenBox.classList.toggle('active',locked);
+  document.querySelector('#capture').textContent=locked?'Cursor locked (Esc to exit)':'Lock cursor';
+});
+
+let dxAcc=0,dyAcc=0;
+
+img.addEventListener('mousemove',e=>{
+  const locked=document.pointerLockElement===img;
+  const mx=locked?e.movementX:(e.clientX-(lastPoint?lastPoint[0]:e.clientX));
+  const my=locked?e.movementY:(e.clientY-(lastPoint?lastPoint[1]:e.clientY));
+  lastPoint=[e.clientX,e.clientY];
+
+  if(right||mode.value==='look'){
+    yaw-=mx*Number(document.querySelector('#lookSpeed').value);
+    pitch=Math.max(-1.35,Math.min(1.35,pitch-my*Number(document.querySelector('#lookSpeed').value)));
+    posePending=true;
+  } else if(locked || mode.value==='mouse') {
+    dxAcc += mx;
+    dyAcc += my;
+  }
+});
+
+img.addEventListener('mouseleave',()=>{lastPoint=null;});
+
+img.addEventListener('mousedown',e=>{
+  e.preventDefault();
+  lockPointer();
+  if(e.button===2){
+    right=true;
+  } else if(e.button===0){
+    queue.push(['d']);
+  }
+});
+
+window.addEventListener('mouseup',e=>{
+  if(e.button===2)right=false;
+  else if(e.button===0)queue.push(['u']);
+});
+
+img.oncontextmenu=e=>e.preventDefault();
+
+img.addEventListener('wheel',e=>{
+  e.preventDefault();
+  const unit=e.deltaMode===1?16:e.deltaMode===2?800:1;
+  wheel-=e.deltaY*unit/100;
+},{passive:false});
+
+for(const kind of ['keydown','keyup'])img.addEventListener(kind,e=>{
+  const k=keys[e.code];
+  if(k){
+    e.preventDefault();
+    if(!e.repeat)queue.push(['k',k,kind==='keydown'?1:0]);
+  }
+});
+
+function release(){
+  queue=[];
+  wheel=0;
+  dxAcc=0;
+  dyAcc=0;
+  right=false;
+  post('/release',{});
+}
+
+window.addEventListener('blur',release);
+document.addEventListener('pointerlockchange',()=>{
+  if(document.pointerLockElement!==img)release();
+});
+window.addEventListener('pagehide',()=>{
+  ws?.close();
+  fetch('/release',{method:'POST',headers:{'Content-Type':'application/json','X-Control-Token':token},body:'{}',keepalive:true});
+});
+
+document.querySelectorAll('[data-look]').forEach(b=>b.onclick=()=>{
+  const d=b.dataset.look;
+  if(d==='left')yaw+=.174533;
+  if(d==='right')yaw-=.174533;
+  if(d==='up')pitch+=.174533;
+  if(d==='down')pitch-=.174533;
+  pitch=Math.max(-1.35,Math.min(1.35,pitch));
+  posePending=true;
+});
+
+document.querySelector('#escape').onclick=()=>post('/input',{commands:[['k',1,1],['k',1,0]]});
+document.querySelector('#reset').onclick=()=>{yaw=pitch=0;posePending=true;};
+
+setInterval(async()=>{
+  if(sending)return;
+  sending=true;
+  try{
+    if(Math.round(dxAcc)!==0 || Math.round(dyAcc)!==0){
+      const sendX=Math.max(-1000,Math.min(1000,Math.round(dxAcc)));
+      const sendY=Math.max(-1000,Math.min(1000,Math.round(dyAcc)));
+      queue.push(['m',sendX,sendY]);
+      dxAcc -= sendX;
+      dyAcc -= sendY;
+    }
+    if(Math.abs(wheel)>.001){
+      queue.push(['w',Math.max(-20,Math.min(20,wheel))]);
+      wheel=0;
+    }
+    if(queue.length)await post('/input',{commands:queue.splice(0,100)});
+    if(posePending){
+      posePending=false;
+      await post('/pose',{yaw,pitch});
+      document.querySelector('#angles').textContent=`Head ${Math.round(yaw*180/Math.PI)}° · ${Math.round(pitch*180/Math.PI)}°`;
+    }
+  }finally{
+    sending=false;
+  }
+},8);
+
+setInterval(async()=>{
+  try{
+    const s=await (await fetch('/status?token='+token)).json();
+    document.querySelector('#status').textContent=`${s.status} · ${displayed} displayed/s · ${videoDrops} skipped`;
+    displayed=0;
+  }catch{}
+},1000);
+</script></html>

@@ -33,13 +33,35 @@ kernel and vendor layer (Android 12L, API 32, arm64 on Hypervisor.framework). On
 
 ## License
 
-GPL-3.0. See `LICENSE`.
+GPL-3.0-only. See `LICENSE`.
 
 ## Status (2026-10-05)
 
 Boots the Quest's Android to `sys.boot_completed`. Meta's VR runtime, VrShell, ShellEnv, SystemUX, Horizon and Store
-all run; the compositor runs and the headset counts as mounted (display on). The screen is still black.
+all run. Tracking accepts a stationary desktop pose through Meta's `TrackingDataInjection` service.
+The Bubbles home, universal dock, coach cards and guest mouse cursor render in both eyes.
+Boots show a live emulator window by default (`HEADLESS=1` hides it).
 
-Current blocker: `trackingservice` aborts with "Unable to parse IMU calibration for IMU with ID 0" (calibration JSON
-built in `hal/sensors.cpp`; schema recovered with `strorder.py`/`strrefs.py`). Once it starts, poses go in through
-Meta's own `TrackingDataInjection` service (`libtrackinginjection-service.so`, allowed for uid 0/1000).
+Settings now renders correctly in both eyes (`screenshots/34-settings-user-confirmed.png`).
+The compositor's external-image programs retained optional vertex sampler2D uniforms on
+unit0, overlapping the panel's external sampler and rejecting draws. The GLES shim now
+initializes those optional samplers on distinct units when external programs are linked or
+loaded from cache; runtime assignments still take precedence. Ordinary home shaders retain
+their original defaults. `persist.macvr.samplerdefaults=0` disables this compatibility fix.
+
+App Library's panel chrome also renders; content availability and loading still need testing.
+Full OS usability, desktop input, networking, application lifecycle and sustained stability
+remain in progress. See `PROGRESS.md` for evidence and remaining verification.
+
+## Runtime controls
+
+After the live window has finished starting, `./launch.sh settings`,
+`./launch.sh library`, or `./launch.sh browser https://example.com` opens a panel.
+Browser HTTPS page loading is verified. Connect the guest to the emulator's
+`AndroidWifi` network in Settings; its saved connection survives cold boots.
+
+`./input.sh` creates a guest Bluetooth mouse/keyboard and reads commands from stdin:
+`m 20 0` moves, `c` clicks, `d`/`u` holds/releases the left button, `r` right-clicks,
+`w 1` scrolls, and `k 108 1`/`k 108 0` presses/releases Linux KEY_DOWN.
+Keep the process running while using it. Host mouse/keyboard forwarding is still
+in progress.
