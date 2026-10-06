@@ -16,6 +16,14 @@
 #include <map>
 #include <mutex>
 #include <new>
+#include <thread>
+#include <unistd.h>
+#include <fmq/EventFlag.h>
+#include <fmq/MessageQueue.h>
+#include "touch_calibration.h"
+using ::android::hardware::EventFlag;
+using ::android::hardware::MessageQueue;
+using ::android::hardware::kSynchronizedReadWrite;
 using namespace vendor::oculus::hardware::sensors::V1_0;
 using ::android::hardware::Return;
 
@@ -101,6 +109,18 @@ static std::string imuJson() {
     return R"json({"FileFormat":{"Version":"0","Timestamp":"2022-07-01T09:08:03","UnixTime":1656666483},"Device":{"SerialNumber":"0","DeviceType":"Hollywood","BuildType":"DVT_A","BuildSubType":""},"Metadata":{"AlgorithmVersion":0,"Source":"Factory","Tags":[],"NamedTags":{}},"ImuCalibration":{"Id":"imu0","SensorType":"ICM42686","DeviceFromImu":[1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1],"Accelerometer":{"Model":"Linear","RectificationMatrix":[1,0,0,0,1,0,0,0,1],"Offset":{"Model":"Constant","ConstantOffset":[0,0,0]},"DtAccelRef":0},"Gyroscope":{"Model":"Linear","RectificationMatrix":[1,0,0,0,1,0,0,0,1],"Offset":{"Model":"Constant","ConstantOffset":[0,0,0]},"DtGyroRef":0}}})json";
 }
 
+// Touch controller factory calibration in Constellation's format. ponytail: a debug override file (needs permissive
+// SELinux) lets the document be tuned without a rebuild.
+static std::string touchJson() {
+    if (FILE* f = fopen("/data/local/tmp/emuxr2-touch.json", "r")) {
+        std::string s; char b[4096]; size_t n;
+        while ((n = fread(b, 1, sizeof b, f)) > 0) s.append(b, n);
+        fclose(f);
+        return s;
+    }
+    return TOUCH_JSON;
+}
+
 static int ashmemWith(const std::string& s) {
     int fd = ashmem_create_region("macvr-calibration", s.size() + 1);
     if (fd < 0) return -1;
@@ -177,7 +197,9 @@ struct Camera : ICameraProvider {
 #define STREAM(name, T) Return<Result> name(const MQ<T>&, const sp<ISensorClient>&, const FmqConfig&) override { return Result::OK; }
 struct StreamingClient : IControllerStreamingClient {
     Return<void> dispose() override { return {}; }
-    Return<void> getCalibrationData(const ControllerAddr&, getCalibrationData_cb cb) override { Zero<0> z; cb(z.as<ControllerCalibrationData>()); return {}; }
+    // the controller manager only needs a document to hand on (its tracking comes from injection, not the IMU)
+    Return<void> getCalibrationData(const ControllerAddr&, getCalibrationData_cb cb) override {
+        ControllerCalibrationData d{}; d.json = touchJson(); cb(d); return {}; }
     Return<void> enable(const ControllerAddr&) override { return {}; }
     Return<void> disable(const ControllerAddr&) override { return {}; }
     Return<bool> controlInputADCStreaming(const ControllerAddr&, bool) override { return true; }
@@ -208,8 +230,48 @@ struct ManagementClient : IControllerManagementClient {
     Return<Result> updateFirmware(const ControllerAddr&, ControllerType, const FWUpdateCallbackConfig&) override { return Result::OK; }
 };
 
+// ---- controllers ----
+// Two Quest 2 Touch controllers, paired and connected, so Meta's controller manager registers them with tracking.
+// Their poses and buttons come from the headset through TrackingDataInjection (input/Injector.java), not from here.
+static std::array<PairedControllerInfo, 2> touchControllers() {
+    std::array<PairedControllerInfo, 2> c{};
+    for (int i = 0; i < 2; i++) {
+        PairedControllerInfo& p = c[i];
+        p.addr() = 0xC0FFEE00A000ull + i;   // 48-bit like a radio address: the injection service parses ids as signed
+        p.connected() = 1;
+        p.battery() = 100.f;
+        strcpy(p.serial(), i ? "1WMHHEMUXR2R" : "1WMHHEMUXR2L");
+        strcpy(p.firmware(), "1.0.0");
+        p.flags() = 0x40 | 0x200 | (i ? 0x10 : 0x20);   // controller, Constellation-tracked (Quest 1/2 Touch), hand
+    }
+    return c;
+}
+// the connection-state stream: the client's queue, its event flag, and the bit that says "written"
+struct StateStream {
+    std::unique_ptr<MessageQueue<PairedControllerInfo, kSynchronizedReadWrite>> q;
+    EventFlag* flag = nullptr;
+    uint32_t written = 0;
+};
+static std::mutex stateLock;
+static std::vector<std::shared_ptr<StateStream>> stateStreams;
+static void publishStates() {   // repeated each second: the latest state survives a reader that missed a wake
+    for (;;) {
+        auto c = touchControllers();
+        {
+            std::lock_guard<std::mutex> l(stateLock);
+            for (auto& s : stateStreams)
+                if (s->q->availableToWrite() >= c.size() && s->q->write(c.data(), c.size()) && s->flag) s->flag->wake(s->written);
+        }
+        sleep(1);
+    }
+}
+
 struct Controllers : IControllerProvider {
-    Return<void> getPairedControllers(getPairedControllers_cb cb) override { cb({}); return {}; }
+    Return<void> getPairedControllers(getPairedControllers_cb cb) override {
+        auto c = touchControllers();
+        hidl_vec<PairedControllerInfo> v; v.setToExternal(c.data(), c.size());
+        ALOGI("controllers: reporting 2 paired Touch controllers");
+        cb(v); return {}; }
     Return<bool> setWirelessFreqBlocklist(const ControllerWirelessFreqBlocklist&) override { return true; }
     Return<void> getWirelessFreqBlocklist(getWirelessFreqBlocklist_cb cb) override { Zero<> z; cb(z.as<ControllerWirelessFreqBlocklist>(), false); return {}; }
     Return<bool> clearWirelessFreqBlocklist() override { return true; }
@@ -217,7 +279,20 @@ struct Controllers : IControllerProvider {
     Return<bool> allowDevice(const SecureDeviceInfo&) override { return true; }
     Return<sp<IControllerManagementClient>> getManagementClient() override { return new ManagementClient; }
     Return<sp<IControllerStreamingClient>> getStreamingClient() override { return new StreamingClient; }
-    Return<Result> prepareStateStream(const MQ<PairedControllerInfo>&, const sp<ISensorClient>&, const FmqConfig&) override { return Result::OK; }
+    Return<Result> prepareStateStream(const MQ<PairedControllerInfo>& d, const sp<ISensorClient>&, const FmqConfig& f) override {
+        auto s = std::make_shared<StateStream>();
+        s->q.reset(new MessageQueue<PairedControllerInfo, kSynchronizedReadWrite>(d));
+        if (!s->q->isValid()) { ALOGW("controllers: state stream queue invalid"); return Result::OK; }
+        if (s->q->getEventFlagWord()) EventFlag::createEventFlag(s->q->getEventFlagWord(), &s->flag);
+        else if (f.eventFlag.getNativeHandle() && f.eventFlag->numFds >= 1)
+            EventFlag::createEventFlag(dup(f.eventFlag->data[0]), 0, &s->flag);
+        s->written = f.writeNotification;
+        ALOGI("controllers: state stream (%zu slots, event flag %p, bits %x/%x)", s->q->getQuantumCount(), s->flag, f.readNotification, f.writeNotification);
+        std::lock_guard<std::mutex> l(stateLock);
+        stateStreams.push_back(s);
+        static std::once_flag started;
+        std::call_once(started, [] { std::thread(publishStates).detach(); });
+        return Result::OK; }
     STREAM(prepareCurlStream, CurlData) STREAM(prepareImuStream, ControllerImuData) STREAM(prepareInputStream, ButtonData)
     STREAM(preparePrecisionPadStream, PrecisionPadData) STREAM(prepareMultiTouchStream, MultiTouchData)
     STREAM(prepareStylusStream, StylusData) STREAM(prepareStatsStream, WirelessDeviceStats) STREAM(preparePoseStream, PoseInput)

@@ -17,6 +17,7 @@ import java.lang.reflect.Method;
  */
 public class Capture {
     static final String ACTION = "com.oculus.systemactivities.BEGIN_VIDEO_CAPTURE_WITH_SURFACE";
+    static final String STOP = "com.oculus.systemactivities.STOP_VIDEO_CAPTURE";
     static final int BOTH_EYES = 2;
     static SurfaceControl layer;   // held for the process lifetime: a collected layer or Surface ends the capture
     static Surface surface;
@@ -72,6 +73,11 @@ public class Capture {
         SystemProperties.set("debug.emuxr2.capture", w + "x" + h);
 
         Object am = Class.forName("android.app.ActivityManager").getMethod("getService").invoke(null);
+        // a capture the runtime stopped itself (a swap error) or never released ignores the next start: stop it first
+        Intent stop = new Intent(STOP).setPackage("com.oculus.systemdriver");
+        stop.putExtra("_ci_", trustedToken(am));
+        broadcast(am, stop);
+        Thread.sleep(300);
         Intent i = new Intent(ACTION).setPackage("com.oculus.systemdriver");
         i.putExtra("_ci_", trustedToken(am));
         i.putExtra("surface", surface);

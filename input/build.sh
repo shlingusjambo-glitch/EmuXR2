@@ -8,12 +8,17 @@ mkdir -p "$HERE/out"
 # In-guest Java helpers, run with app_process as root (javac + d8: the NDK's binder stub lacks AServiceManager):
 # Injector (head poses into TrackingDataInjection) and Capture (Horizon's undistorted stereo view onto the display).
 # Hidden framework classes are compiled against stubs/ and resolved from the boot classpath at run time.
-JDK=${JAVA_HOME:-/opt/homebrew/opt/openjdk@21}
+export JAVA_HOME=${JAVA_HOME:-/opt/homebrew/opt/openjdk@21}   # d8 needs it too
+JDK=$JAVA_HOME
 ANDROID_JAR=$(ls "$HOME/Library/Android/sdk/platforms/android-"*/android.jar | sort -V | tail -n 1)
 D8=$(ls -d "$HOME/Library/Android/sdk/build-tools/"*/d8 | sort -V | tail -n 1)
 for c in Injector Capture; do
     rm -rf "$HERE/out/$c" && mkdir -p "$HERE/out/$c"
-    "$JDK/bin/javac" -source 8 -target 8 -nowarn -cp "$ANDROID_JAR" -sourcepath "$HERE/stub" -d "$HERE/out/$c" "$HERE/$c.java"
-    "$D8" --min-api 31 --lib "$ANDROID_JAR" --output "$HERE/out/$c" "$HERE/out/$c/$c"*.class
+    set -- "$HERE/$c.java"
+    if [ "$c" = Injector ]; then set -- "$@" "$HERE/LatestPacketInput.java" "$HERE/HomeButton.java"; fi
+    "$JDK/bin/javac" -source 8 -target 8 -nowarn -cp "$ANDROID_JAR" -sourcepath "$HERE/stub" -d "$HERE/out/$c" "$@"
+    set -- "$HERE/out/$c/$c"*.class
+    if [ "$c" = Injector ]; then set -- "$@" "$HERE/out/$c/LatestPacketInput.class" "$HERE/out/$c/HomeButton.class"; fi
+    "$D8" --min-api 31 --lib "$ANDROID_JAR" --output "$HERE/out/$c" "$@"
     mv "$HERE/out/$c/classes.dex" "$HERE/out/$(echo $c | tr A-Z a-z).dex"
 done

@@ -12,6 +12,8 @@
 #include <unistd.h>
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "MacVR-GLES", __VA_ARGS__)
 
+#include "texture_buffer_macvr.h"
+
 // Qualcomm's compiler (which Meta's shaders were written against) accepts #extension after other code and a fragment
 // shader with no default float precision; ANGLE follows the spec. Top-level #extension lines move up under #version,
 // and fragment shaders get a default float precision (a later declaration still overrides it).
@@ -55,7 +57,7 @@ void glShaderSource(GLuint shader, GLsizei count, const GLchar *const *string, c
     char *v = strstr(s, "#version 320 es");
     if (v) memcpy(v, "#version 310 es", 15);
     GLint type = 0; glGetShaderiv(shader, GL_SHADER_TYPE, &type);
-    char *t = relaxed(s, type == GL_FRAGMENT_SHADER);
+    char *t = macvrBufferShader(relaxed(s, type == GL_FRAGMENT_SHADER));
     char dump[PROP_VALUE_MAX] = {0};
     __system_property_get("persist.macvr.shaders", dump);
     if (!strcmp(dump, "1") && t[0]) {
@@ -99,12 +101,12 @@ static void samplerDefaults(GLuint program) {
 void glLinkProgram(GLuint program) {
     static void (*f)(GLuint);
     if (!f) f = dlsym(RTLD_NEXT, "glLinkProgram");
-    f(program); samplerDefaults(program);
+    f(program); macvrForgetBufferProgram(program); samplerDefaults(program);
 }
 void glProgramBinary(GLuint program, GLenum format, const void *binary, GLsizei length) {
     static void (*f)(GLuint, GLenum, const void *, GLsizei);
     if (!f) f = dlsym(RTLD_NEXT, "glProgramBinary");
-    f(program, format, binary, length); samplerDefaults(program);
+    f(program, format, binary, length); macvrForgetBufferProgram(program); samplerDefaults(program);
 }
 
 void glGetActiveUniformBlockiv(GLuint program, GLuint block, GLenum pname, GLint *params) {
@@ -167,8 +169,10 @@ const GLubyte *glGetString(GLenum name) {
     if (name != GL_EXTENSIONS || !s) return s;
     int views = wantsViews();
     if (s == src[views] && cache[views]) return (const GLubyte *)cache[views];
-    free(cache[views]); char *c = cache[views] = malloc(strlen((const char *)s) + 32); strcpy(c, (const char *)s); src[views] = s;
+    free(cache[views]); char *c = cache[views] = malloc(strlen((const char *)s) + 64); strcpy(c, (const char *)s); src[views] = s;
     if (views && !strstr(c, "GL_OES_texture_view")) { strcat(c, " GL_OES_texture_view"); LOG("advertising GL_OES_texture_view"); }
+    // Float buffer textures are emulated by shader storage buffers.
+    if (views && !strstr(c, "GL_EXT_texture_buffer")) { strcat(c, " GL_EXT_texture_buffer"); LOG("advertising GL_EXT_texture_buffer"); }
     for (unsigned i = 0; i < sizeof hidden / sizeof *hidden; i++) {
         char *p = strstr(c, hidden[i]);
         if (p) { size_t n = strlen(hidden[i]); memmove(p, p + n + (p[n] == ' '), strlen(p + n + (p[n] == ' ')) + 1); LOG("hiding %s", hidden[i]); }
@@ -205,7 +209,7 @@ static void externalDrawResult(void) {
 void glUseProgram(GLuint program) {
     static void (*f)(GLuint);
     if (!f) f = dlsym(RTLD_NEXT, "glUseProgram");
-    f(program);
+    f(program); macvrUseBufferProgram(program); macvrBindBufferSamplers();
     char enabled[PROP_VALUE_MAX] = {0};
     __system_property_get("debug.macvr.dumpexternal", enabled);
     if (!strcmp(enabled, "1") && program) {
@@ -223,7 +227,7 @@ void glUseProgram(GLuint program) {
 void glUniform1i(GLint location, GLint value) {
     static void (*f)(GLint, GLint);
     if (!f) f = dlsym(RTLD_NEXT, "glUniform1i");
-    f(location, value);
+    f(location, value); macvrBindBufferSamplers();
     char enabled[PROP_VALUE_MAX] = {0};
     __system_property_get("debug.macvr.dumpexternal", enabled);
     static unsigned count;

@@ -548,7 +548,7 @@ EGLBoolean eglSwapBuffersWithDamageKHR(EGLDisplay, EGLSurface, EGLint *, EGLint)
 __eglMustCastToProperFunctionPointerType eglGetProcAddress(const char *name) {
     static __eglMustCastToProperFunctionPointerType (*f)(const char *);
     if (!f) f = real("eglGetProcAddress");
-    if (!strcmp(name, "glShaderSource") || !strcmp(name, "glCompileShader") || !strcmp(name, "glGetActiveUniformBlockiv") || !strcmp(name, "glValidateProgram") || !strcmp(name, "glLinkProgram") || !strcmp(name, "glProgramBinary") ||
+    if (!strcmp(name,"glMapBufferRange") || !strcmp(name,"glUnmapBuffer") || !strcmp(name,"glGetBufferParameteriv") || !strcmp(name,"glDeleteProgram") || !strcmp(name,"glTexBufferEXT") || !strcmp(name,"glTexBuffer") || !strcmp(name,"glBindTexture") || !strcmp(name,"glActiveTexture") || !strcmp(name,"glBindBuffer") || !strcmp(name,"glBufferData") || !strcmp(name,"glBufferSubData") || !strcmp(name,"glUseProgram") || !strcmp(name,"glUniform1i") || !strcmp(name, "glShaderSource") || !strcmp(name, "glCompileShader") || !strcmp(name, "glGetActiveUniformBlockiv") || !strcmp(name, "glValidateProgram") || !strcmp(name, "glLinkProgram") || !strcmp(name, "glProgramBinary") ||
         !strcmp(name, "glFramebufferTextureMultiviewOVR") || !strcmp(name, "glFramebufferTextureMultisampleMultiviewOVR") ||
         !strcmp(name, "glBindFramebuffer") || !strcmp(name, "glFenceSync")) {
         void *shim = dlopen("libGLESv2_macvr.so", RTLD_NOW | RTLD_NOLOAD);

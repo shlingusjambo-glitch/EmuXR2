@@ -14,6 +14,7 @@ import json
 import math
 import mmap
 import os
+import queue
 import socket
 import struct
 import subprocess
@@ -29,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import quest_proto as qp
 
 ADB = os.environ.get('ANDROID_SDK_ROOT', os.path.expanduser('~/Library/Android/sdk')) + '/platform-tools/adb'
-EMU = 'emulator-5554'
+EMU = os.environ.get('EMUXR2_SERIAL', 'emulator-5554')
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, '..', 'input', 'out')
 INJECTOR_PORT, QUEST_PORT = 7791, 9945
@@ -38,11 +39,16 @@ INJECTOR_PORT, QUEST_PORT = 7791, 9945
 # matched features, p' = K R K^-1 p): square pixels, f = 572.3 px, optical centre x 501.6 / 458.4, y 587.6.
 CAP_W, CAP_H, EYE_W = 1920, 1080, 960
 ENC_H = 1088   # encoded height: 16-aligned (the Quest 1 AVC decoder drops frames at 1080); extra rows are black
+# Horizon's raw tracking space has its floor at y = -1.675 without a Guardian (the runtime logs RawFloorHeight); the
+# Quest's stage space has it at 0. Injected heights are moved onto the guest's floor so eye height stays true.
+GUEST_FLOOR = float(os.environ.get('EMUXR2_GUEST_FLOOR', -1.675))
 FOCAL, CENTRE_X, CENTRE_Y = 572.3, (501.6, 458.4), 587.6
 FOV = [[math.atan(-cx / FOCAL), math.atan((EYE_W - cx) / FOCAL),
         math.atan(CENTRE_Y / FOCAL), math.atan(-(ENC_H - CENTRE_Y) / FOCAL)] for cx in CENTRE_X]
 MARK_BLOCKS, MARK = 36, 8   # pose-number stamp: 36 blocks of 8x8 px along the bottom-left edge
 FPS, BITRATE = 60, 25_000_000
+DEFAULT_PROF = {'codec': 'h264', 'eye_w': EYE_W, 'eye_h': ENC_H,
+                'fps': FPS, 'bitrate': BITRATE, 'device': 'default'}
 LOG = open('/tmp/emuxr2-stream.log', 'a', buffering=1)
 
 
@@ -64,26 +70,64 @@ def quest_serial():
     return None
 
 
+def wait_injector(timeout=25):
+    """Wait until the guest injector has bound its port (its JVM takes seconds to boot).
+
+    Without this the adb forward accepts the host connection while the guest leg is
+    refused, leaving a socket that connects but never reaches the injector."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        r = adb('shell', 'grep -q "Injector: listening" /data/local/tmp/injector.log')
+        if r.returncode == 0:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def prepare_library():
+    """Use Horizon's native offline Library when no account has been added."""
+    if os.environ.get('EMUXR2_LOCAL_ACCOUNT', 'auto') == '0':
+        return
+    check = adb('shell', 'dumpsys account')
+    if check.returncode == 0 and 'Account {' not in check.stdout:
+        adb('shell', 'oculuspreferences --setc local_account_mode_enabled_v1 true')
+
+
 def start_guest(capture_only=False):
     """(Re)start the injector and the capture in the guest; their dex files come from input/build.sh."""
+    # the guest has no proximity sensor to wake it: asleep, it composes nothing and the stream freezes
+    adb('shell', 'dumpsys battery set ac 1; svc power stayon true; input keyevent WAKEUP')
+    # no room to guard: Guardian only retries spatial anchors (~15/s), burning CPU and leaking memory
+    adb('shell', 'setprop persist.oculus.guardian_disable 1')
+    if not capture_only:
+        prepare_library()
     for dex in ('injector', 'capture'):
         adb('push', f'{OUT}/{dex}.dex', f'/data/local/tmp/{dex}.dex')
     which = 'Capture' if capture_only else '(Injector|Capture)'
     adb('shell', f'for p in $(pgrep -f "[a]pp_process.*{which}"); do kill $p; done')
     time.sleep(0.5)
     if not capture_only:
+        adb('shell', 'rm -f /data/local/tmp/injector.log')
+        # Only one head-pose producer may own TrackingDataInjection.
+        adb('shell', 'setprop ctl.stop macvr-pose')
         adb('shell', 'CLASSPATH=/data/local/tmp/injector.dex setsid nohup app_process /system/bin Injector '
                      '> /data/local/tmp/injector.log 2>&1 < /dev/null &')
     adb('shell', f'CLASSPATH=/data/local/tmp/capture.dex setsid nohup app_process / Capture {CAP_W} {CAP_H} '
                  f'{CAP_W} {CAP_H} > /data/local/tmp/capture.log 2>&1 < /dev/null &')
     adb('forward', f'tcp:{INJECTOR_PORT}', f'tcp:{INJECTOR_PORT}')
+    if not capture_only and not wait_injector():
+        log('warning: guest pose injector not listening yet; poses will reconnect on first send')
 
 
 class Display:
     """The emulator's shared framebuffer: header (width, height, fps, frame counter, ...) then BGRA pixels."""
 
     def __init__(self):
-        fd = ctypes.CDLL(None).shm_open(b'videmulator5554', os.O_RDONLY, 0)
+        result = adb('emu', 'screenrecord', 'webrtc', 'start', '72')
+        names = [line.strip() for line in result.stdout.splitlines() if line.strip().startswith('videmulator')]
+        if result.returncode or not names:
+            raise RuntimeError('cannot start emulator framebuffer capture: ' + result.stdout + result.stderr)
+        fd = ctypes.CDLL(None).shm_open(names[0].encode(), os.O_RDONLY, 0)
         if fd < 0:
             sys.exit('emulator framebuffer not found: is the emulator running?')
         self.m = mmap.mmap(fd, os.fstat(fd).st_size, access=mmap.ACCESS_READ)
@@ -105,6 +149,12 @@ class Display:
         up = raw if self.w > self.h else np.rot90(raw, -1)   # the panel scans out portrait
         return n, np.ascontiguousarray(up)
 
+    def current(self):
+        """The current upright image regardless of the frame counter, or None."""
+        up = self.px.copy() if self.w > self.h else np.rot90(self.px.copy(), -1)
+        img = np.ascontiguousarray(up)
+        return img if img.shape == (CAP_H, CAP_W) else None
+
 
 def pose_number(img):
     """The stamped pose number, or None when this isn't a capture frame."""
@@ -116,31 +166,123 @@ def pose_number(img):
 
 
 class Guest:
-    """The pose injector's socket, reconnected (with the guest helpers restarted) when it drops."""
+    """Latest-pose mailbox: guest reconnection must never block headset packet reads."""
 
     def __init__(self):
         self.sock = None
+        self.pending = queue.Queue(maxsize=1)
+        self.stopping = threading.Event()
+        self.worker = None
 
     def connect(self):
-        for attempt in range(2):
-            for _ in range(50):
-                try:
-                    self.sock = socket.create_connection(('127.0.0.1', INJECTOR_PORT), timeout=2)
-                    self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                    return
-                except OSError:
-                    time.sleep(0.2)
-            log('guest pose injector unreachable: restarting the guest helpers')
-            start_guest()
-        sys.exit('guest pose injector unreachable')
+        self.sock = socket.create_connection(('127.0.0.1', INJECTOR_PORT), timeout=1)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        if self.worker is None:
+            self.worker = threading.Thread(target=self._pump, daemon=True)
+            self.worker.start()
 
     def send(self, data):
         try:
-            self.sock.sendall(data)
-        except OSError:
-            log('guest pose injector dropped; reconnecting')
-            self.connect()
-            self.sock.sendall(data)
+            self.pending.put_nowait(data)
+        except queue.Full:
+            try:
+                self.pending.get_nowait()
+            except queue.Empty:
+                pass
+            self.pending.put_nowait(data)
+
+    def _pump(self):
+        failures = 0
+        while not self.stopping.is_set():
+            try:
+                data = self.pending.get(timeout=.1)
+            except queue.Empty:
+                continue
+            try:
+                if self.sock is None:
+                    self.connect()
+                    # Discard the pose held while reconnecting in favor of the latest.
+                    try:
+                        data = self.pending.get_nowait()
+                    except queue.Empty:
+                        pass
+                self.sock.sendall(data)
+                failures = 0
+            except OSError as e:
+                if self.sock is not None:
+                    self.sock.close()
+                    self.sock = None
+                failures += 1
+                if failures == 1:
+                    log('guest injector disconnected:', e)
+                if failures >= 10:
+                    log('restarting guest injector after repeated connection failures')
+                    start_guest()
+                    failures = 0
+                self.stopping.wait(.2)
+
+    def close(self):
+        self.stopping.set()
+        if self.sock is not None:
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        if self.worker is not None:
+            self.worker.join(timeout=2)
+        if self.sock is not None:
+            self.sock.close()
+
+
+# Meta's injection service's button ids, as bits
+TRIGGER, HOME, BACK, STICK, GRIP, AX, BY, THUMBREST = (1 << i for i in range(8))
+# The EGL shim emulates float buffer textures through shader storage buffers,
+# allowing the guest controller models and cursor renderer to run on ANGLE ES 3.1.
+# EMUXR2_CONTROLLERS=0 opts out.
+CONTROLLERS = os.environ.get('EMUXR2_CONTROLLERS') != '0'
+
+
+def touch_controller(hand, left, menu):
+    """One Quest controller as (flags, pressed, touched, trigger, grip, stick x, stick y) for the guest. menu is
+    retained for compatibility. The left menu button directly drives guest Home."""
+    b = hand['buttons']
+    active = hand['flags'] & qp.HAND_ACTIVE and hand['flags'] & 2 and not hand['flags'] & 4   # posed, not a bare hand
+    pressed = touched = 0
+    if hand['trigger'] > 0.6: pressed |= TRIGGER
+    if hand['trigger'] > 0.05 or b & 64: touched |= TRIGGER
+    if hand['squeeze'] > 0.6: pressed |= GRIP
+    if hand['squeeze'] > 0.05: touched |= GRIP
+    if b & (qp.BTN_X if left else qp.BTN_A): pressed |= AX
+    if b & (qp.BTN_Y if left else qp.BTN_B): pressed |= BY
+    if b & qp.BTN_STICK_CLICK: pressed |= STICK
+    if b & 256: touched |= STICK
+    if b & 128: touched |= THUMBREST
+    if left and b & qp.BTN_MENU:
+        pressed |= HOME
+    if not active or not CONTROLLERS:
+        return (0, 0, 0, 0.0, 0.0, 0.0, 0.0)
+    return (1 if active and CONTROLLERS else 0, pressed, touched | pressed, hand['trigger'], hand['squeeze'], *hand['stick'])
+
+
+def negotiate(hello):
+    """Encode profile + client CONFIG for a HELLO dict; raises ValueError on bad HELLO.
+
+    The encoded frame is always eye_w*2 x eye_h (what CONFIG advertises, what the
+    headset's decoder surface is): the guest's native 960x1088 eyes, H.264;
+    refresh is capped at the reported headset rate and 72 Hz.
+    """
+    prof = dict(DEFAULT_PROF)
+    prof.update(qp.device_profile(hello))
+    # the guest's own pixels: upscaling to the headset's eye size adds host encode and resample time (latency) and no
+    # detail; the headset's compositor scales the layer anyway
+    prof['eye_w'], prof['eye_h'] = EYE_W, ENC_H
+    requested = int(os.environ.get('EMUXR2_FPS', prof['fps']))
+    if not 30 <= requested <= 72:
+        raise ValueError('EMUXR2_FPS must be between 30 and 72')
+    prof['fps'] = min(prof['fps'], requested)
+    config = {'codec': prof['codec'], 'eye_w': prof['eye_w'], 'eye_h': prof['eye_h'],
+              'fps': prof['fps'], 'mic': False, 'pair': 'emuxr2', 'fov': FOV}
+    return prof, config
 
 
 class Session:
@@ -149,11 +291,15 @@ class Session:
         self.lock = threading.Lock()
         self.stop = False
         self.need_idr = True
+        self.prof = dict(DEFAULT_PROF)
+        self.frame_id = 0
         self.seq = int(time.time() * 1000) & 0x3FFFFFFF   # fresh numbers each run: the guest still shows the last ones
         self.times = {}          # pose number -> the headset's tracking time
         self.origin = None       # first head position: the guest's floor origin is put under it
+        self.menu = [0, 0]       # left menu button: held since, Back pulse until
         self.encoder = None
         self.status_at = 0
+        self.hellos = queue.Queue()
 
     def send(self, ptype, payload):
         with self.lock:
@@ -170,20 +316,29 @@ class Session:
 
     def configure(self, hello):
         log('HELLO:', json.dumps(hello))
+        try:
+            prof, config = negotiate(hello)
+        except ValueError as e:
+            log('bad HELLO:', e)
+            return
         # x264 zerolatency: its stream tells the decoder not to hold frames back (VideoToolbox's doesn't, and the
         # Quest's decoder then sits on ~5 frames). Rate-capped so a busy frame can't stall the link.
+        if self.encoder is not None:
+            try:
+                self.encoder.close()
+            except Exception:
+                pass
         c = av.CodecContext.create('libx264', 'w')
-        c.width, c.height, c.pix_fmt = CAP_W, ENC_H, 'yuv420p'
-        c.time_base, c.framerate = Fraction(1, 1_000_000), Fraction(FPS, 1)
-        c.bit_rate, c.gop_size, c.max_b_frames = BITRATE, 10 * FPS, 0
-        kbps = BITRATE // 1000
+        c.width, c.height, c.pix_fmt = prof['eye_w'] * 2, prof['eye_h'], 'yuv420p'
+        c.time_base, c.framerate = Fraction(1, 1_000_000), Fraction(prof['fps'], 1)
+        c.bit_rate, c.gop_size, c.max_b_frames = prof['bitrate'], 10 * prof['fps'], 0
+        kbps = prof['bitrate'] // 1000
         c.options = {'preset': 'ultrafast', 'tune': 'zerolatency',
-                     'x264-params': f'vbv-maxrate={kbps}:vbv-bufsize={kbps // FPS * 2}:repeat-headers=1'}
+                     'x264-params': f'vbv-maxrate={kbps}:vbv-bufsize={kbps // prof["fps"] * 2}:repeat-headers=1'}
         c.open()
         self.encoder = c
+        self.prof = prof
         self.need_idr = True
-        config = {'codec': 'h264', 'eye_w': EYE_W, 'eye_h': ENC_H, 'fps': FPS, 'mic': False,
-                  'pair': 'emuxr2', 'fov': FOV}
         self.send(2, json.dumps(config).encode())
         log('CONFIG:', json.dumps(config))
 
@@ -198,7 +353,13 @@ class Session:
         self.seq += 1
         self.times[self.seq] = t['time_ns']
         self.times.pop(self.seq - 512, None)
-        self.guest.send(struct.pack('<I7f', self.seq, px - self.origin[0], py, pz - self.origin[1], qx, qy, qz, qw))
+        ox, oz = self.origin
+        packet = struct.pack('<I7f', self.seq, px - ox, py + GUEST_FLOOR, pz - oz, qx, qy, qz, qw)
+        for h, hand in enumerate(t['hands']):
+            f, pressed, touched, trigger, grip, sx, sy = touch_controller(hand, h == 0, self.menu)
+            gx, gy, gz, *q = hand['grip']
+            packet += struct.pack('<3I7f4f', f, pressed, touched, gx - ox, gy + GUEST_FLOOR, gz - oz, *q, trigger, grip, sx, sy)
+        self.guest.send(packet)
 
     def reader(self):
         try:
@@ -209,7 +370,7 @@ class Session:
                     raise ConnectionError('oversize packet')
                 payload = self.recv_exact(plen) if plen else b''
                 if ptype == 1:
-                    self.configure(json.loads(payload or b'{}'))
+                    self.hellos.put(json.loads(payload or b'{}'))
                 elif ptype == 3:
                     self.on_tracking(payload)
                 elif ptype == 7:
@@ -218,87 +379,166 @@ class Session:
                     self.status_at = time.monotonic()
                     log('quest:', payload.decode('utf-8', 'replace')[:200])
         except (OSError, ValueError, ConnectionError) as e:
-            log('reader ended:', e)
+            if not self.stop:
+                log('reader ended:', e)
         finally:
             self.stop = True
 
+    def emit(self, pixels, when):
+        """Encode one full-res padded frame and send it as VIDEO."""
+        fw, fh = self.prof['eye_w'] * 2, self.prof['eye_h']
+        frame = av.VideoFrame.from_ndarray(pixels.view(np.uint8).reshape(ENC_H, CAP_W, 4), format='bgra')
+        if (fw, fh) == (CAP_W, ENC_H):
+            frame = frame.reformat(format='yuv420p')
+        else:
+            frame = frame.reformat(width=fw, height=fh, format='yuv420p')
+        frame.pts = int(time.monotonic() * 1_000_000)
+        if self.need_idr:
+            self.need_idr = False
+            frame.pict_type = av.video.frame.PictureType.I
+        for pkt in self.encoder.encode(frame):
+            header = struct.pack('<QQB', self.frame_id, when, 1 if pkt.is_keyframe else 0)
+            self.send(4, header + bytes(pkt))
+            self.frame_id += 1
+
     def run(self):
-        threading.Thread(target=self.reader, daemon=True).start()
-        last, sent_seq, sent_sig, sent_at, frame_id, n, t0, skipped = None, None, None, 0.0, 0, 0, time.monotonic(), {}
+        reader = threading.Thread(target=self.reader, daemon=True)
+        reader.start()
+        try:
+            self._run()
+        finally:
+            self.stop = True
+            try:
+                self.client.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            reader.join(timeout=3)
+
+    def _run(self):
+        last, sent_seq, sent_sig, sent_at, n, t0, skipped = None, None, None, 0.0, 0, time.monotonic(), {}
         padded = np.zeros((ENC_H, CAP_W), np.uint32)
+        last_when = 0
+        last_pixels = None   # last encoded frame, re-sent while the display is frozen
+        idle_interval = 1.0 / max(1, min(72, int(os.environ.get('EMUXR2_IDLE_FPS', '1'))))
         stamped_at = time.monotonic()
+        capture_restarts = 0
         while not self.stop:
-            last, img = self.display.grab(last)
-            if img is None:
-                time.sleep(0.001)
+            try:
+                hello = self.hellos.get_nowait()
+            except queue.Empty:
+                pass
+            else:
+                self.configure(hello)
+            now = time.monotonic()
+            if self.encoder is not None and now - sent_at < 1.0 / self.prof['fps']:
+                time.sleep(min(.001, 1.0 / self.prof['fps'] - (now - sent_at)))
                 continue
-            if time.monotonic() - stamped_at > 3:   # the capture ended (e.g. the runtime restarted): ask again
-                log('no capture frames for 3 s: restarting the guest capture')
+            last, img = self.display.grab(last)
+            if now - stamped_at > 5:
+                capture_restarts += 1
+                if capture_restarts >= 2:
+                    # after a swap error the runtime's capture ignores new requests until the runtime restarts
+                    log('capture still dead: restarting the guest VR runtime')
+                    adb('shell', 'kill $(pidof com.oculus.vrruntimeservice)')
+                    time.sleep(20)
+                    capture_restarts = 0
+                else:
+                    log('no stamped capture frames for 5 s: restarting guest capture')
                 start_guest(capture_only=True)
                 stamped_at = time.monotonic()
-            if self.encoder is None or img.shape != (CAP_H, CAP_W):
-                continue
-            seq = pose_number(img)
-            now = time.monotonic()
-            if seq is not None:
-                stamped_at = now
-            when = self.times.get(seq)
-            sig = img[::16, ::16]   # the emulator display repeats frames: skip ones identical to the last sent
-            why = 'unstamped' if seq is None else 'unknown pose' if when is None else \
-                'repeat' if seq == sent_seq and np.array_equal(sig, sent_sig) else None
-            if why and now - sent_at > 1 and seq is not None:
-                # keep-alive (the client drops a silent link after 5 s): the newest pose's time, or 0 before any
-                # tracking, which the client decodes but never shows
-                why, when = None, self.times.get(self.seq, 0)
-            if why:
-                skipped[why] = skipped.get(why, 0) + 1
-                continue
-            padded[:CAP_H] = img
-            padded[CAP_H - MARK:CAP_H, :MARK_BLOCKS * MARK] = 0
-            frame = av.VideoFrame.from_ndarray(padded.view(np.uint8).reshape(ENC_H, CAP_W, 4), format='bgra')
-            frame = frame.reformat(format='yuv420p')
-            frame.pts = int(now * 1_000_000)
-            if self.need_idr:
-                self.need_idr = False
-                frame.pict_type = av.video.frame.PictureType.I
-            for pkt in self.encoder.encode(frame):
-                header = struct.pack('<QQB', frame_id, when, 1 if pkt.is_keyframe else 0)
-                self.send(4, header + bytes(pkt))
-                frame_id += 1
-            sent_seq, sent_sig, sent_at = seq, sig.copy(), now
-            n += 1
+            if img is None:
+                # frozen display (idle scene): keep a frame a second flowing, or the
+                # client times out and flaps through HELLO/CONFIG re-handshakes.
+                # Prefer the last encoded frame; before the first one, the current
+                # display contents with the (stale) stamp band blanked.
+                if self.encoder is not None and now - sent_at >= idle_interval:
+                    if last_pixels is None:
+                        cur = self.display.current()
+                        if cur is None:
+                            time.sleep(0.001)
+                            continue
+                        padded[:CAP_H] = cur
+                        padded[CAP_H - MARK:CAP_H, :MARK_BLOCKS * MARK] = 0
+                        last_pixels = padded.copy()
+                    self.emit(last_pixels, last_when)
+                    sent_at, behind, n = now, 0, n + 1
+                else:
+                    time.sleep(0.001)
+                    continue
+            else:
+                if self.encoder is None or img.shape != (CAP_H, CAP_W):
+                    continue
+                seq = pose_number(img)
+                if seq is not None:
+                    stamped_at = now
+                    capture_restarts = 0
+                when = self.times.get(seq)
+                sig = img[::16, ::16]   # the emulator display repeats frames: skip ones identical to the last sent
+                why = 'unstamped' if seq is None else 'unknown pose' if when is None else \
+                    'repeat' if seq == sent_seq and np.array_equal(sig, sent_sig) else None
+                if seq is not None and not self.times and idle_interval < 1.0:
+                    # No XR tracking while the headset is asleep: decoder may still
+                    # consume frames, but timestamp zero prevents incorrect display.
+                    why, when = None, 0
+                if why and now - sent_at > 1 and seq is not None:
+                    # Preserve the captured pose on repeats; never label old pixels with a newer pose.
+                    why, when = None, when or 0
+                if why:
+                    skipped[why] = skipped.get(why, 0) + 1
+                    continue
+                padded[:CAP_H] = img
+                padded[CAP_H - MARK:CAP_H, :MARK_BLOCKS * MARK] = 0
+                self.emit(padded, when)
+                last_pixels = padded.copy()
+                last_when = when
+                sent_seq, sent_sig, sent_at = seq, sig.copy(), now
+                behind, n = (self.seq - seq if when else 0), n + 1
             if now - t0 >= 5:
-                log(f'video: {n / (now - t0):.1f} fps, pose {self.seq - seq} behind, skipped {skipped} ')
+                log(f'video: {n / (now - t0):.1f} fps @{self.prof["eye_w"] * 2}x{self.prof["eye_h"]}, '
+                    f'pose {behind} behind, skipped {skipped} ')
                 n, t0, skipped = 0, now, {}
 
 
 def main():
     display = Display()
     log(f'emulator framebuffer {display.w}x{display.h}')
-    start_guest()
     guest = Guest()
-    guest.connect()
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(('127.0.0.1', QUEST_PORT))
-    srv.listen(1)
-    quest = quest_serial()
-    if quest:
-        adb('reverse', f'tcp:{QUEST_PORT}', f'tcp:{QUEST_PORT}', serial=quest)
-        log(f'headset {quest}: adb reverse tcp:{QUEST_PORT}')
-    log(f'waiting for the headset on {QUEST_PORT}')
-    while True:
-        client, addr = srv.accept()
-        client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        log('headset connected')
+    try:
+        start_guest()
+        guest.connect()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(('127.0.0.1', QUEST_PORT))
+        srv.listen(1)
+        quest = quest_serial()
+        if quest:
+            adb('reverse', f'tcp:{QUEST_PORT}', f'tcp:{QUEST_PORT}', serial=quest)
+            log(f'headset {quest}: adb reverse tcp:{QUEST_PORT}')
+        log(f'waiting for the headset on {QUEST_PORT}')
+        while True:
+            client, addr = srv.accept()
+            client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            client.settimeout(5)
+            log('headset connected')
+            try:
+                Session(client, display, guest).run()
+            except OSError as e:
+                log('session ended:', e)
+            finally:
+                client.close()
+            log('headset gone; waiting for it to reconnect')
+    finally:
+        srv.close()
+        guest.close()
         try:
-            Session(client, display, guest).run()
-        except OSError as e:
-            log('session ended:', e)
-        finally:
-            client.close()
-        log('headset gone; waiting for it to reconnect')
+            adb('shell', 'for p in $(pgrep -f "[a]pp_process.*(Injector|Capture)"); do kill $p; done; '
+                         'setprop ctl.start macvr-pose')
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        log('streamer stopped')

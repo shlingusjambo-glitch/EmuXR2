@@ -22,7 +22,12 @@ enum class ZapMessageClass : uint8_t {};
 enum class TimeDomain : uint8_t {};
 
 // opaque (only ever passed through by reference)
-struct ChannelSettings; struct FrameRateSettings; struct FmqConfig; struct MotionStreamProperties;
+struct ChannelSettings; struct FrameRateSettings; struct MotionStreamProperties;
+// A stream's notification setup (libvrsensors-hidlwrapper StreamHandle::prepareStream, libeventflaghelper): the event
+// flag is a 4-byte ashmem shared by a client's composite stream; the reader wakes the first bit after reading and
+// waits for the second, which the writer wakes after writing
+struct FmqConfig { hidl_handle eventFlag; uint32_t readNotification, writeNotification; };
+static_assert(sizeof(FmqConfig) == 24, "FmqConfig is 24 bytes");
 struct ControllerWirelessFreqBlocklist; struct SecureHostInfo; struct SecureDeviceInfo; struct MotionSensorProperties;
 struct IadProperties; struct ControllerAddr;
 struct ImuData; struct MagData; struct IadData; struct ExternalTimestampData; struct ZapMessage; struct CurlData;
@@ -30,7 +35,21 @@ struct ControllerImuData; struct ButtonData; struct PrecisionPadData; struct Mul
 struct WirelessDeviceStats; struct PoseInput; struct ControllerInputADCData; struct ControllerCollisionEvent;
 // element types of vectors handed back empty (complete only so hidl_vec<> compiles; never serialized)
 struct CameraProperties { uint32_t id; hidl_string a, b; };   // 40 bytes (libvrsensors-hidlwrapper reads id@0, strings@8,@24)
-struct PairedControllerInfo { uint8_t opaque[64]; };
+// 448 bytes, plain data (the interface library reads count * 0x1c0; Meta's OVR::Sensors type has the same layout).
+// Fields from libcmsservice-headset (ControllerGlue::assignSlot / initializeRemoteLocked, RemoteDevice::processStateChange):
+//   @0x08 u64 address, @0x10 u8 connected, @0x12 u8 (and-ed with connected), @0x14 float battery 0-100,
+//   @0x18 char[16] serial, @0x28 char[] firmware version, @0xa8 char[] (a further string),
+//   @0x128 u64 flags: 0x40 controller, 0x20 left / 0x10 right (one slot each), 0x200 Constellation (Touch), 0x400 self-tracked (Pro); trackingservice aborts without one
+struct PairedControllerInfo {
+    uint8_t b[0x1c0];
+    uint64_t& addr() { return *reinterpret_cast<uint64_t*>(b + 0x08); }
+    uint8_t& connected() { return b[0x10]; }
+    float& battery() { return *reinterpret_cast<float*>(b + 0x14); }
+    char* serial() { return reinterpret_cast<char*>(b + 0x18); }
+    char* firmware() { return reinterpret_cast<char*>(b + 0x28); }
+    uint64_t& flags() { return *reinterpret_cast<uint64_t*>(b + 0x128); }
+};
+static_assert(sizeof(PairedControllerInfo) == 0x1c0, "PairedControllerInfo is 448 bytes");
 
 #define MACVR_IFACE(X) struct X : public ::android::hidl::base::V1_0::IBase { static const char* descriptor; MACVR_IBASE_OVERRIDES };
 MACVR_IFACE(ISensorClient)
@@ -41,7 +60,10 @@ enum class CameraSyncMode : uint32_t {};
 enum class ControllerType : uint32_t {};
 struct FrameSet; struct CameraStreamMetadata; struct CameraStreamConfiguration; struct MuxState; struct ExposureGainSettings;
 struct Resolution { uint8_t opaque[16]; };
-struct ControllerCalibrationData; struct ControllerLedConfig; struct ThumbstickADCRange; struct SimpleHapticIntensity { uint8_t v; };
+// libvrsensors-hidlwrapper's conversion: a 16-bit status, then the factory calibration document
+struct ControllerCalibrationData { uint16_t status; hidl_string json; };
+static_assert(sizeof(ControllerCalibrationData) == 24, "ControllerCalibrationData is 24 bytes");
+struct ControllerLedConfig; struct ThumbstickADCRange; struct SimpleHapticIntensity { uint8_t v; };
 struct AdvertisingControllerInfo { uint8_t opaque[64]; };
 
 struct ICameraStream : public ::android::hidl::base::V1_0::IBase {

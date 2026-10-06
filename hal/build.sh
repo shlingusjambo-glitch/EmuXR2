@@ -5,7 +5,7 @@ set -e
 FW=$1; cd "$(dirname "$0")"; mkdir -p out lib
 N=~/Library/Android/sdk/ndk/27.2.12479018/toolchains/llvm/prebuilt/darwin-x86_64
 V=$FW/aosp/vndk D=/opt/homebrew/opt/e2fsprogs/sbin/debugfs
-for l in libhidlbase libutils libcutils libc++ libbase; do [ -f lib/$l.so ] || $D -R "dump /system/apex/com.android.vndk.current/lib64/$l.so lib/$l.so" $FW/work/system.img >/dev/null 2>&1; done
+for l in libhidlbase libutils libcutils libc++ libbase libfmq; do [ -f lib/$l.so ] || $D -R "dump /system/apex/com.android.vndk.current/lib64/$l.so lib/$l.so" $FW/work/system.img >/dev/null 2>&1; done
 for l in liblog; do [ -f lib/$l.so ] || $D -R "dump /system/lib64/$l.so lib/$l.so" $FW/work/system.img >/dev/null 2>&1; done
 for l in $(cd $FW/fs/vendor/lib64 && ls vendor.oculus.*.so); do cp -f $FW/fs/vendor/lib64/$l lib/; done
 RES=$($N/bin/clang -print-resource-dir)
@@ -15,7 +15,7 @@ INC="-nostdinc -isystem $V/external/libcxx/include -isystem $RES/include -isyste
  -I$V/system/libhwbinder/include -I$V/system/core/libsystem/include -I$V/system/libfmq/include -I$V/generated-headers/system/libhidl/transport/base/1.0/android.hidl.base@1.0_genc++_headers/gen
  -I$V/generated-headers/system/libhidl/transport/manager/1.0/android.hidl.manager@1.0_genc++_headers/gen"
 $N/bin/clang++ --target=aarch64-linux-android31 -std=c++17 -O2 -fno-rtti -fPIE -pie -nostdinc++ -nostdlib++ -D__ANDROID_VNDK__ -Wno-unused-parameter $INC \
-  -o out/macvr-hal *.cpp -Llib -l:libhidlbase.so -l:libutils.so -l:libcutils.so -l:liblog.so -l:libc++.so -l:libbase.so \
+  -o out/macvr-hal *.cpp -Llib -l:libhidlbase.so -l:libutils.so -l:libcutils.so -l:liblog.so -l:libc++.so -l:libbase.so -l:libfmq.so \
   -l:vendor.oculus.hardware.graphics.composer@1.0.so -l:vendor.oculus.hardware.graphics.composer@1.1.so -l:vendor.oculus.hardware.sensors_java@1.0.so -l:vendor.oculus.hardware.sensors@1.0.so -l:vendor.oculus.hardware.devicecert@1.0.so -Wl,--allow-shlib-undefined
 ls -la out/macvr-hal
 

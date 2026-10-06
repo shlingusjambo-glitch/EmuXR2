@@ -89,9 +89,9 @@ def device_profile(hello):
         # dropped 5-7 frames/s on the non-16-aligned 1080 height, while
         # native size holds a clean 30/0.)
         return {'device': 'quest1', 'codec': 'h264', 'eye_w': eye_w,
-                'eye_h': eye_h, 'fps': 30, 'bitrate': 20_000_000}
+                'eye_h': eye_h, 'fps': fps, 'bitrate': 20_000_000}
     return {'device': 'generic', 'codec': 'h264', 'eye_w': eye_w,
-            'eye_h': eye_h, 'fps': min(fps, 30), 'bitrate': 20_000_000}
+            'eye_h': eye_h, 'fps': fps, 'bitrate': 20_000_000}
 
 
 def aim_to_cursor(aim_q, head_q, screen=(SCREEN_W, SCREEN_H)):

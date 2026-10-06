@@ -232,3 +232,140 @@ Settings's actual display behavior is observed.
 - Live emulator remains session79484; browser runs with network. No restart was
   needed for browser/input changes. Goal remains active; depth/overlay, Library
   content, host input, audio and application lifecycle still require completion.
+
+## Quest streaming stability (2026-10-06)
+
+- Symptom: Quest 1 stream glitched/froze, no 3DOF, no controllers, shell crash-looped
+  (vrshell SIGSEGV fault addr 0x0 on ShellMainVR, 20x) and trackingservice aborted 68x
+  ('Controller capabilities must include one of {Selftracked, Constellation}').
+- Root cause 1 (proven by disassembly): vrshell's extension-gated loader keeps a NULL
+  glTexBufferEXT unless "GL_EXT_texture_buffer" appears in glGetString (libshell.so:
+  strstr gate, then eglGetProcAddress into the table; the cursor renderer calls the
+  table entry and jumps to address zero). Guest ANGLE resolves the entry (non-NULL,
+  verified with a guest probe binary) but does not list the string. Trigger is the
+  first controller cursor (CoTextureCursorRendererGLES). Reproduced live: 12 s of
+  controller-present injection crash-looped the shell; head-only injection is harmless.
+- Root cause 2: bridge/stream.py ignored quest_proto.device_profile, so the Quest 1
+  (1216x1344 eyes) was fed 1920x1088 @ 60 fps / 25 Mbps, which its AVC decoder cannot
+  sustain. Also fixed: Guest.connect() raced the injector's JVM boot (the adb forward
+  accepts while the guest leg is refused, leaving a dead pose socket); start_guest()
+  now waits for "Injector: listening" (wait_injector).
+- Fixes: stream.py negotiate() applies device_profile (Quest 1: 2432x1344 @ 30 fps /
+  20 Mbps with the rendered FOV in CONFIG, 30 fps pacing, reformat rescale) plus the
+  readiness wait; egl/gles_macvr.c advertises GL_EXT_texture_buffer to com.oculus.*
+  processes (scoped; other apps see the unchanged string); CONTROLLERS now defaults on
+  (EMUXR2_CONTROLLERS=0 opts out). New bridge test: test_stream_config.py.
+- Verified: 839 controller-present + 737 button/stick/trigger packets, zero crashes or
+  aborts, same vrshell PID throughout; clean reboot, zero tombstones since; Quest 1
+  encode path benchmarks 124 fps (headroom); bridge tests pass (10 unittest +
+  stream_config + touch_controller). New shim confirmed live in the guest by md5 and
+  the "advertising GL_EXT_texture_buffer" log line.
+- The trackingservice capability abort is NOT reproducible: disassembly shows the check
+  reads the paired-controller flags at +0x128 and accepts bit 9 (0x200 Constellation,
+  which hal/sensors.cpp sets). The 23:20 loop was transient; no HAL change was needed.
+- Deployment note: the live guest runs the super image baked at boot; debugfs edits to
+  emu/emu_vendor.img only take effect after a boot.sh reboot (guest page cache + baked
+  super — restarting processes alone loads stale code). Rebooted 00:19, fix verified live.
+- Still needs the user wearing the headset: end-to-end tracking/video, cursor-model
+  visibility (the cursor shader declares `#extension GL_EXT_texture_buffer : require`,
+  which ANGLE's compiler may still reject -> invisible cursor, no crash), jitter feel,
+  scale feel. The shell currently shows its loading void when idle (no layers submitted;
+  panels did not open this boot) — home-content work stays with OS usability, not streaming.
+- Follow-up flap found while handing off: with a static scene the emulator display
+  freezes (SurfaceFlinger idles with no damage: 0 shm frames in 6 s), so stream.py sent
+  nothing at all — the old 1 Hz keep-alive only fires when frames flow — and the Quest
+  client hit its 5 s socket timeout and flap-looped through HELLO/CONFIG (decoder
+  reconfigured cleanly at 2432x1344, verified in the client log). Session.run() now
+  re-sends the last encoded frame at 1 Hz while frozen (Session.emit refactor, newest
+  tracking time), keeping the link up with no re-handshake. Covered by a new
+  configure+emit socketpair round-trip in test_stream_config.py. While verifying,
+  the user put the headset on: 153 flap-reconnects confirmed the diagnosis, and after
+  deploying the fix the link held with zero reconnects (1 Hz keep-alive, pose 0
+  behind, decode ~1 fps, no drops). Extended once more for a fully frozen display
+  (no frame ever sent): the first keep-alive now uses the current display contents
+  via Display.current() with the stamp band blanked. Same PIDs (trackingservice,
+  vrshell) through all controller bombardments, the reboot, and live Quest use.
+- Added start-emulator.sh (fast boot from the assembled sysdir, no rebuild; use
+  boot.sh after hal/egl/vk/compat changes) and start-streamer.sh (preflight + exec
+  bridge/stream.py in the foreground). Preflight verified live; the reboot path itself
+  reuses boot.sh's flags and was not re-run to avoid disrupting the live session.
+
+
+## Goal continuation, 2026-10-06: flashing navy and invalid competing poses
+
+- User objective is in ~/.codex/attachments/a96199c9-ffb8-4b89-8aee-4f64acc22815/goal-objective.md. User explicitly authorized autonomous work while asleep. Goal remains incomplete.
+- AgentCollab localhost:8765 refused all startup/read/claim calls. Existing uncommitted changes predate this work; preserve them.
+- Proven live black-scene cause: compat/pose.sh reads FOUR quaternion values from /data/local/tmp/macvr-head, which contained SEVEN position+quaternion values (`0 1.6 0 0 0.0697 0 0.9976`). Invalid quaternion is injected every 50ms, competing with Injector.java. Stopping macvr-pose and injecting identity immediately restored Bubbles and Library chrome. Screenshots goal-single-injector and goal-capture-restored show the result. Both helpers running also means headset pose is repeatedly overwritten, explaining a source of jitter.
+- stream.py now stops desktop macvr-pose before starting Injector. compat/pose.sh supports both four and seven component files. Saved head file normalized live. Updated script bind-mounted live and written into work/system.img with e2put; boot.sh rebuild still needed for persistence in sysdir.
+- Guest battery was unpowered, mStayOn=false, mWakefulness=Asleep despite svc power stayon true. Stream startup now sets emulated AC power first; live Awake/StayOn=true verified.
+- Display now starts `adb emu screenrecord webrtc start 72` and uses returned shm name instead of opening stale shared memory blindly. Counter advanced 105 frames/2s live. This is framebuffer production, not headset decode acceptance.
+- Frozen resends now preserve captured tracking timestamp instead of attaching newest pose to stale pixels. Capture watchdog runs even when framebuffer has no updates. Left menu now maps directly to guest Home on press and release, without Back/tap or hold delay; inactive controllers return released values. start-streamer selects .venv automatically with EMUXR2_PYTHON override. start-emulator handles unset EMUARGS and syncs guest before shutdown.
+- Tests passed: ten protocol unittests, test_touch_controller, test_stream_config (including real x264 encoding/socket roundtrip and frozen display). Add a regression asserting a nonzero captured timestamp is unchanged on frozen repeat; currently frozen test covers timestamp zero only.
+- Library still spins: logs say OCMS empty/uninitialized, unknown-source fetch successfully finds com.AnotherAxiom.GorillaTag. Need inspect native route/filter behavior and get usable local apps without fabricating entitlement/authentication.
+- Native Quest renderer clear color (0.02,0.03,0.06) matches reported navy. It discards video if timestamp doesn't match 144-entry history or age >1s. Existing repeated frames with newest timestamp incorrectly rebound to current pose; no wearer verification yet. Quest asleep/disconnected after startup. Decode remains unverified.
+- Current emulator boot log ~/MacVRFirmware/boot.log, runtime healthy ~68-71/72 fps in VrApi logs. Streamer exec session 86891 waiting for headset, start-emulator session 43766. Capture restarted live; Injector remains alive (port7791). macvr-pose stopped. Synthetic stationary head packet seq1000 injected for verification. Need restart streamer after further code edits.
+- NEXT: release stale input on tracking loss in Injector; move reconnect work away from headset packet reader; add timestamp regression, test 72fps encode feasibility and expose validated rate choice; solve Library local-app filter; deploy full image/reboot and repeat stability checks. Examine proprietary files only outside repo. Goal not complete.
+
+### Autonomous goal continuation: controllers and installed graphics (2026-10-06)
+
+- The previously installed HAL differed from the current build and did not publish paired Touch controllers. Built and installed the current HAL, then verified TrackingService exposes both paired 6DOF remotes. Live testing showed the handedness bits were reversed: 0x20 is Left, 0x10 is Right. Corrected the HAL flags and cold-booted; `/tmp/emuxr2-coldboot-tracking.txt` confirms A000 Left at x=-0.25 and A001 Right at x=+0.25, both valid. Trigger injection reached 0.85 in both guest remotes.
+- Merely advertising GL_EXT_texture_buffer exposed a new VrShell abort: its controller morph shaders require samplerBuffer, unsupported by the installed ANGLE/Vulkan ES 3.1 compiler. Confirmed using a real GLES context; glRequestExtensionANGLE cannot enable it. Implemented float buffer-texture compatibility in `egl/texture_buffer_macvr.h`: float samplerBuffer shaders use shader storage buffers, and buffer texture bindings follow the application's sampler unit and backing buffer. Supported formats are R32F/RG32F/RGB32F/RGBA32F. Shader/program metadata is cached to avoid uniform reflection on every input update. Integer formats and general ES 3.2 buffer-texture features remain outside this compatibility path.
+- Built and installed both graphics shim libraries into the firmware vendor image. Cold boot loaded the new HAL (md5 e9ea531a80d603d43ec28da93fd3ac96) and shims without hot mounts. Guest controller models and pointer rays are visible; screenshots `goal-buffer-controllers.png` and `goal-coldboot-library-ready.png` show actual rendered models. The latter also shows Library loaded with Settings and Files. No new fatal signals/shader failures in the cold-boot log during the initial 45-second controller session.
+- Added an on-device GLES test (`egl/tests/run_texture_buffer.sh`) that renders through the installed shim, reads pixels, updates the buffer and verifies updated pixels. RGBA32F read/update passes with GL error zero (64/128/191/255 then 191/128/191/255). This is real rendering validation, not just source substitution testing.
+- Live controller session: 1663 captured frames in 45 seconds at 2432x1344 with exact tracking timestamps, sequential frame IDs and IDR recovery. Current guest fresh-frame throughput with rendered controllers/Library is roughly 35–40 fps, lower than the earlier session without rendered controller geometry. Do not conflate this with the separate Quest1 decoder throughput test (~70–72 decoded fps while XR consumer sleeps). Headset smoothness at 72 unique frames is not established.
+- Java injector now drains complete queued pose snapshots before injection, retaining the newest and preserving a partial following packet. Drain is bounded at 64 snapshots. `input/tests/LatestPacketInputTest.java` verifies latest selection, partial preservation and bounded work; helper build includes the new class in DEX. A 144 Hz live tracking overload/pose-age test is in progress. `bridge/live_smoke.py` now reports median/p95 captured pose age and fails a configurable latency threshold.
+- Latest Android client APK (unique decoder PTS mapping extracted into VideoTimestampMap) installed successfully on connected Quest1 1PASH9AZ2Y9397 after the cold boot. Quest2 hardware is not attached; its physical interaction remains unverified.
+- Earlier Python config/input/recovery/protocol tests pass again. EMUXR2_FPS now validates 30–72 to match the client CONFIG constraints; corrected stale 30-fps profile/controller-support comments.
+
+Current processes: foreground emulator held by exec session 1619; ordinary streamer session 7449; overload smoke session 77104. AgentCollab service remained unavailable (connection refused); no other agents were dispatched. Firmware binaries/proprietary shader dumps remain outside Git.
+
+- 144 Hz overload completed: 2211 captured frames/60 s, median pose age 80.8 ms, p95 127.1 ms (250 ms threshold), no growing backlog. Latest-snapshot draining is installed in the running injector.
+- Expanded installed-shim GPU test: all four float formats R32F/RG32F/RGB32F/RGBA32F read and update correctly, GL error zero.
+- Quest client now drops untracked/unknown decoder output before SurfaceTexture presentation, preserving the tracked texture while still counting every decoded output for diagnostics. Mapper tests pass; APK rebuilt successfully and installed. No native main.cpp change was needed: PosePrediction already rejects repeated source timestamps and stalls.
+- Installed GorillaTag launches and renders actual game hands (screenshots `goal-game-launch.png`, `goal-game-menu.png`). A 60 s moving-controller game stream produced 3100 captured frames (~51.7 fps), median pose age 67.5 ms / p95 90.5 ms. Its backend authentication reported PlayFab errors, so online gameplay was not validated. No bypasses or entitlement changes were made.
+- Important menu finding: left Menu reaches ServiceInputManager Home down/up and queues native exit dialog (`systemux://dialog/exit`) in-game, but that overlay is not visible in the capture. Android Home successfully returns the guest to desktop. Added an off-thread short-release desktop fallback in the injector, preserving native long-hold recenter and avoiding navigation on controller loss/timeout. `persist.emuxr2.home_fallback=0` opts out. HomeButton pure-Java tests cover short releases, long holds, repeat release, controller loss, timeout reset. Live fallback transition test ran as session 39098 and is reported below. Streamer now session 56293, emulator still 1619.
+- `launch.sh app <package>` now resolves an installed MAIN activity safely and launches it. Native local-account Library does not show every sideloaded game; direct launch supplies a practical route without fabricating entitlements. Corrected installed route to `/library/installed`.
+- Live short-menu fallback completed: 774 captured frames/20 s, median pose age 75.4 ms / p95 122.4 ms. VrFocus changed from GorillaTag to ShellEnv/VrShell and screenshot `goal-home-fallback.png` shows the guest dock and controller rays. This verifies actual navigation, not just button-state receipt.
+- Final Quest1 hardware decode check is running with `EMUXR2_IDLE_FPS=72`; this diagnostic intentionally emits untracked timestamp-zero frames when XR tracking is absent. The client decodes them but does not present them. It cannot establish in-headset comfort or Quest2 interaction. Diagnostic streamer 76716, device logcat 40788; restore ordinary configuration after collecting results. Goal remains active because physical headset presentation/comfort and Quest2 hardware cannot be verified while the user sleeps.
+- Final installed Quest1 client decode diagnostic sustained ~70.4–71.7 decoded fps at 2432x1344 H.264 (approximately 13–14 Mbps) for over 40 seconds. `release_fps=0` is intentional: no XR tracking samples while the headset is unworn, so all timestamp-zero diagnostic output is rejected for presentation. Therefore receive-to-release metrics are undefined/zero in this test, and it proves decoder throughput only. Saved relevant device output to `/tmp/emuxr2-quest-final-decode.log`.
+- Final cold boot now runs emulator session 51590 and ordinary streamer session 58130. Installed-shim four-format GPU test passes after reboot, without hot mounts. An additional 60-second/144 Hz controller overload check is running (1664).
+- Tried tracked presentation without a wearer using actions actually registered on the Quest: `com.oculus.vrpowermanager.prox_close`, then restoring with prox_far and automation_disable. This woke the device and produced one real tracking sample, but the headset's system shell kept the app paused (`ClearActivity`/VrFocus), so video age stayed unavailable. Do not treat decoder releases as XR presentations. Restored original sleeping state via SLEEP, proximity automation disabled, stay_on_while_plugged_in remains its original 7. Client was force-stopped during the attempt; no new tracked-presentation claim is supported. Physical comfort/Quest2 acceptance remains unverified.
+- Final cold-boot 144 Hz soak passed: 2257 captured frames/60 s, median captured-pose age 85.7 ms / p95 130.4 ms (250 ms limit), exact timestamps, ordered frame IDs, fragmented HELLO and IDR recovery. Cold-boot log has no new fatal signals or failed shaders. Guest remains Awake/stay-on, desktop macvr-pose service stopped while streamer owns injection. Ordinary streamer 58130 and foreground emulator 51590 remain running and ready for the headset; Quest is back Asleep with proximity automation disabled. Tests/builds/syntax checks and both repositories' diff whitespace checks pass. No commits/pushes were made; pre-existing unrelated edits were preserved.
+
+### Goal follow-up audit (2026-10-06)
+
+Previous goal turn made concrete progress: graphics/HAL firmware and client APK installed, cold-boot and overload tests completed. Current emulator and ordinary streamer handles revalidated live; Quest1 remains connected but asleep, Quest2 is absent. Added direct live controller-state evidence beyond poses: held trigger=0.85, grip=0.90, stick click and X/Y (left)/A/B (right) all appear in both TrackingService remotes with the correct left/right handedness. The first command output showed uppercase TR/TP/B0/B1/G and both analog values. A later saved snapshot occurred after the client disconnected, so its held-input assertion failed because the controls had already released; collect a synchronized held snapshot next. This proves the native guest receives those controls rather than merely accepting transport packets. Physical Quest2 input and in-headset comfort/navy-flash acceptance remain unverified; the original objective is not complete.
+- Synchronized native input check passes: `/tmp/emuxr2-held-inputs.txt` asserts both remotes' trigger=0.85, grip=0.90 and pressed trigger/stick/face/grip controls. After client disconnect, `/tmp/emuxr2-released-inputs.txt` asserts trigger/grip zero, all digital inputs released and both sticks centered at 32768. Native control reception and disconnect recovery are verified on the current firmware. Stream remains ready for a new connection.
+
+### Completion/blocker audit
+
+The previous goal turn made progress by proving full native controller button/analog reception and release on disconnect. The remaining blocker is unchanged across the last three goal turns: Quest2 hardware is not attached, and the connected Quest1 is asleep/unworn; its system UI prevents a tracked-presentation acceptance test through the attempted remote proximity override.
+
+Current authoritative checks: ADB lists only Quest1 plus emulator; Quest1 reports Asleep/proximity false; guest boot complete=1; VrShell PID 2173 remains live; installed HAL MD5 matches the current build; current cold-boot log contains no fatal signals or shader failures; normal streamer handle 58130 remains live and waiting for a client.
+
+Requirement audit:
+- Stabilize jitter/lag: invalid quaternion and competing pose writers fixed; reconnect/input backlog and captured-pose identity verified under load (p95 ~130 ms). In-headset comfort and absence of navy flashes are not proven.
+- Quest2 controllers: shared protocol mapping, native paired controller states, models/rays, buttons/analogs and disconnect releases verified in guest. Actual Quest2 device/action behavior is unverified because that hardware is absent.
+- Left Menu / guest Home: native button press/release and short-release return from installed game to guest desktop verified; right physical system menu is not synthesized by the guest mapping. Physical device acceptance remains unverified.
+- Quest1 streaming: installed APK and native-resolution H.264 hardware decode verified; tracked XR presentation is unverified while unworn/system paused.
+- Library loading: native local-account Library rendered after cold boot, with Settings/Files. Sideloaded app launch has a direct installed-package route; online account-backed library/entitlements are not manufactured.
+- Approximately 72 fps decode: installed Quest1 client sustained approximately 71 decoded fps at 2432x1344. Unique guest rendering is scene-dependent (~35–40 Home/Library, ~52 tested game); do not claim 72 unique displayed frames.
+
+All currently actionable code/build/deployment and regression checks are completed. Repeating those tests or adding speculative changes cannot establish the missing physical acceptance. Goal is incomplete and blocked on external headset availability/tracked presentation, with all fixes retained and the normal emulator/streamer ready.
+
+### Stability, scale and performance (2026-10-06)
+
+- Crash loop root cause: the rebuilt vendor image had fallen back to the API 32 emulator ANGLE, which leaks ~400 MB/s
+  inside Meta's compositor (`std::vector` growth in TimeWarp); lmkd killed vrruntimeservice every 10-15 s and took
+  VrShell, ShellEnv and Guardian with it. `patch-extra.sh` now installs the newer ANGLE kept in `~/MacVRFirmware/angle`.
+  Runtime holds ~50 MB.
+- Scale: the guest's raw floor is at y = -1.675 with no Guardian (`RawFloorHeight`), and Quest stage poses were
+  injected unshifted, so the wearer stood ~3.2 m tall. `stream.py` adds `GUEST_FLOOR` to head and controller heights;
+  the injector and `macvr-pose` idle at raw y 0 (the runtime's standing eye height). IPD is normal (63.5-64.9 mm).
+- Near UI swimming: the client predicted position the whole stream latency (up to 100 ms), which is never corrected
+  on display. Orientation keeps the full lead; position and controllers use a quarter of it.
+- Capture recovery: after a swap error the runtime ignores new capture requests. The helper sends STOP before BEGIN,
+  and the streamer restarts the runtime when a second capture restart still yields nothing.
+- Performance: native 1920x1088 encode (no 2432x1344 upscale), ANGLE `asyncCommandQueue` (the compositor no longer
+  stalls in vkResetFences on every swap), Guardian disabled (it retried spatial anchors ~15/s and leaked), 6 vCPUs,
+  console logcat at W. 60 s synthetic soak after a cold boot: median pose age 70 ms, p95 92 ms (was 81/116).
