@@ -101,7 +101,8 @@ Launch things directly with `./launch.sh settings`, `./launch.sh library` or
 | `build_super.py`, `lpdump.py` | rewrite the emulator's dynamic-partition `super` image |
 | `vtable.py`, `hidlsig.py` | recover HIDL interface layouts from your firmware's interface libraries |
 
-More detail on controls, streaming options and diagnostics is in [docs/streaming.md](docs/streaming.md).
+More detail on controls, streaming options and diagnostics is in [docs/streaming.md](docs/streaming.md). For newer
+Horizon OS versions or other hosts, see [docs/porting.md](docs/porting.md) and run `tools/ota_check.py` on the new OTA.
 
 ## Legal
 
