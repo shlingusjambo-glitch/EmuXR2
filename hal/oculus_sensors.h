@@ -1,6 +1,8 @@
 // vendor.oculus.hardware.sensors@1.0 root interfaces, laid out like the interface library in the user's firmware:
 // method order from each BpHw<X> vtable (vtable.py), argument and return types from the BnHw<X> stubs' parcel
 // reads/writes (hidlsig.py). Structs the stand-ins never look inside are left opaque.
+// Meta changed this interface without a new version number: MACVR_SENSORS_REV 2 is its layout from v64 on (hal/build.sh
+// picks it when the firmware's library has ICameraProvider::applyMuxModeByName), 1 the one before.
 #pragma once
 #include "oculus_composer.h"   // MACVR_IBASE_OVERRIDES
 #include <fmq/MQDescriptorBase.h>
@@ -20,6 +22,8 @@ enum class StreamCommand : uint32_t {};
 enum class UtilityFrequency : uint32_t {};
 enum class ZapMessageClass : uint8_t {};
 enum class TimeDomain : uint8_t {};
+enum class CalibrationCachePolicy : uint8_t {};
+enum class MipiClockRate : uint32_t {};
 
 // opaque (only ever passed through by reference)
 struct ChannelSettings; struct FrameRateSettings; struct MotionStreamProperties;
@@ -33,6 +37,7 @@ struct IadProperties; struct ControllerAddr;
 struct ImuData; struct MagData; struct IadData; struct ExternalTimestampData; struct ZapMessage; struct CurlData;
 struct ControllerImuData; struct ButtonData; struct PrecisionPadData; struct MultiTouchData; struct StylusData;
 struct WirelessDeviceStats; struct PoseInput; struct ControllerInputADCData; struct ControllerCollisionEvent;
+struct ControllerAlerts; struct HidInput;
 // element types of vectors handed back empty (complete only so hidl_vec<> compiles; never serialized)
 struct CameraProperties { uint32_t id; hidl_string a, b; };   // 40 bytes (libvrsensors-hidlwrapper reads id@0, strings@8,@24)
 // 448 bytes, plain data (the interface library reads count * 0x1c0; Meta's OVR::Sensors type has the same layout).
@@ -56,6 +61,8 @@ static_assert(sizeof(PairedControllerInfo) == 0x1c0, "PairedControllerInfo is 44
 MACVR_IFACE(ISensorClient)
 MACVR_IFACE(IZapperCallback)
 MACVR_IFACE(IFrameConfigCallback)
+MACVR_IFACE(ICameraProviderClient)
+MACVR_IFACE(IMuxModeTransitionCallback)
 
 enum class CameraSyncMode : uint32_t {};
 enum class ControllerType : uint32_t {};
@@ -74,7 +81,11 @@ struct ICameraStream : public ::android::hidl::base::V1_0::IBase {
     using getConfiguration_cb = std::function<void(Result, const CameraStreamConfiguration&)>;
     using setConfigUpdateHandling_cb = std::function<void(Result, const MuxState&)>;
     virtual Return<void> getMetadata(getMetadata_cb cb) = 0;
+#if MACVR_SENSORS_REV >= 2
+    virtual Return<Result> writeSessionOcalData(const hidl_string& k, const hidl_vec<uint8_t>& d) = 0;
+#else
     virtual Return<Result> writeSessionOcalData(const hidl_vec<uint8_t>& d) = 0;
+#endif
     virtual Return<void> prepareStream(const sp<ISensorClient>& c, const MQ<FrameSet>& q, const FmqConfig& f, prepareStream_cb cb) = 0;
     virtual Return<void> getConfiguration(const sp<ISensorClient>& c, getConfiguration_cb cb) = 0;
     virtual Return<void> setConfigUpdateHandling(const sp<ISensorClient>& c, const sp<IFrameConfigCallback>& f, setConfigUpdateHandling_cb cb) = 0;
@@ -83,7 +94,9 @@ struct ICameraStream : public ::android::hidl::base::V1_0::IBase {
     virtual Return<Result> stopOverridingExposureSettings(const sp<ISensorClient>& c) = 0;
     virtual Return<void> setExposureGain(const sp<ISensorClient>& c, const ExposureGainSettings& s) = 0;
     virtual Return<void> setPhaseOffset(uint64_t ns) = 0;
+#if MACVR_SENSORS_REV < 2
     virtual Return<uint32_t> getFrameRate() = 0;
+#endif
     virtual Return<Result> setCameraSyncMode(CameraSyncMode m) = 0;
     virtual Return<Result> setResolution(const hidl_vec<Resolution>& r) = 0;
     MACVR_IBASE_OVERRIDES
@@ -92,7 +105,11 @@ struct ICameraStreamController : public ::android::hidl::base::V1_0::IBase {
     static const char* descriptor;
     virtual Return<Result> startOverridingExposureSettings() = 0;
     virtual Return<Result> stopOverridingExposureSettings() = 0;
+#if MACVR_SENSORS_REV >= 2
+    virtual Return<Result> setExposureGain(uint8_t cam, uint32_t frame, const ExposureGainSettings& s) = 0;
+#else
     virtual Return<void> setExposureGain(uint8_t cam, uint32_t frame, const ExposureGainSettings& s) = 0;
+#endif
     MACVR_IBASE_OVERRIDES
 };
 MACVR_IFACE(ICameraStreamControlTarget)
@@ -103,7 +120,11 @@ struct IControllerStreamingClient : public ::android::hidl::base::V1_0::IBase {
     using getThumbstickMaxADCRange_cb = std::function<void(const ThumbstickADCRange&, bool)>;
     using getThumbstickDeadzone_cb = std::function<void(float, bool)>;
     virtual Return<void> dispose() = 0;
+#if MACVR_SENSORS_REV >= 2
+    virtual Return<void> getCalibrationData(const ControllerAddr& a, CalibrationCachePolicy p, getCalibrationData_cb cb) = 0;
+#else
     virtual Return<void> getCalibrationData(const ControllerAddr& a, getCalibrationData_cb cb) = 0;
+#endif
     virtual Return<void> enable(const ControllerAddr& a) = 0;
     virtual Return<void> disable(const ControllerAddr& a) = 0;
     virtual Return<bool> controlInputADCStreaming(const ControllerAddr& a, bool on) = 0;
@@ -144,19 +165,35 @@ struct ICameraProvider : public ::android::hidl::base::V1_0::IBase {
     using getProperties_cb = std::function<void(Result, const hidl_vec<CameraProperties>&)>;
     using getCalibrationData_cb = std::function<void(Result, const hidl_handle&)>;
     using getChannels_cb = std::function<void(const ChannelSettings&)>;
+    using status_cb = std::function<void(Result, uint16_t)>;
+    using getCameraMuxModeConfig_cb = std::function<void(Result, const hidl_string&)>;
     virtual Return<void> getProperties(getProperties_cb cb) = 0;
     virtual Return<void> getCalibrationData(uint32_t id, getCalibrationData_cb cb) = 0;
+#if MACVR_SENSORS_REV >= 2
+    virtual Return<void> applyMuxModeByName(const hidl_string& a, const hidl_string& b, status_cb cb) = 0;
+    virtual Return<void> applyMuxMode(const hidl_string& mode, uint8_t flags, status_cb cb) = 0;
+    virtual Return<void> registerMuxModeTransitionCallback(const sp<ICameraProviderClient>& c, const hidl_string& n, const sp<IMuxModeTransitionCallback>& cb) = 0;
+#else
     virtual Return<Result> applyMuxMode(const hidl_string& mode, uint8_t flags) = 0;
+#endif
     virtual Return<sp<ICameraStream>> getStream(FrameType t) = 0;
     virtual Return<sp<ICameraStream>> getStreamByPurpose(const hidl_string& a, const hidl_string& b) = 0;
     virtual Return<sp<ICameraStreamController>> getStreamController(const hidl_string& a, const hidl_string& b) = 0;
     virtual Return<Result> controlStreams(const hidl_vec<sp<ICameraStreamControlTarget>>& t, StreamCommand c) = 0;
     virtual Return<UtilityFrequency> getUtilityFrequency() = 0;
+#if MACVR_SENSORS_REV >= 2
+    virtual Return<void> setUtilityFrequency(UtilityFrequency f, status_cb cb) = 0;
+    virtual Return<Result> setMipiClockRate(const hidl_string& camera, MipiClockRate r) = 0;
+#else
     virtual Return<Result> setUtilityFrequency(UtilityFrequency f) = 0;
+#endif
     virtual Return<void> getChannels(getChannels_cb cb) = 0;
     virtual Return<Result> setChannels(const ChannelSettings& s) = 0;
     virtual Return<Result> setFrameRate(const FrameRateSettings& s) = 0;
     virtual Return<bool> getRawImageMode() = 0;
+#if MACVR_SENSORS_REV >= 2
+    virtual Return<void> getCameraMuxModeConfig(getCameraMuxModeConfig_cb cb) = 0;
+#endif
     MACVR_IBASE_OVERRIDES
 };
 
@@ -173,7 +210,11 @@ struct IControllerProvider : public ::android::hidl::base::V1_0::IBase {
     virtual Return<void> getHostInfo(getHostInfo_cb cb) = 0;
     virtual Return<bool> allowDevice(const SecureDeviceInfo& d) = 0;
     virtual Return<sp<IControllerManagementClient>> getManagementClient() = 0;
+#if MACVR_SENSORS_REV >= 2
+    virtual Return<sp<IControllerStreamingClient>> getStreamingClient(const sp<ISensorClient>& c) = 0;
+#else
     virtual Return<sp<IControllerStreamingClient>> getStreamingClient() = 0;
+#endif
     virtual Return<Result> prepareStateStream(const MQ<PairedControllerInfo>& q, const sp<ISensorClient>& c, const FmqConfig& f) = 0;
     MACVR_STREAM(prepareCurlStream, CurlData)
     MACVR_STREAM(prepareImuStream, ControllerImuData)
@@ -185,6 +226,10 @@ struct IControllerProvider : public ::android::hidl::base::V1_0::IBase {
     MACVR_STREAM(preparePoseStream, PoseInput)
     MACVR_STREAM(prepareInputADCStream, ControllerInputADCData)
     MACVR_STREAM(prepareCollisionEventStream, ControllerCollisionEvent)
+#if MACVR_SENSORS_REV >= 2
+    MACVR_STREAM(prepareAlertsStream, ControllerAlerts)
+    MACVR_STREAM(prepareHidInputStream, HidInput)
+#endif
     MACVR_IBASE_OVERRIDES
 };
 

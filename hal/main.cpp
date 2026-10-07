@@ -4,14 +4,16 @@
 void registerComposer();
 void registerPowerstate();
 void registerSensors();
-void registerDeviceCert();
+void registerDeviceCert();   // only while the firmware has the device certificate HAL (hal/build.sh)
 void registerVsync();
 int main() {
     ::android::hardware::configureRpcThreadpool(4, true);
     registerComposer();
     registerPowerstate();
     registerSensors();
+#if MACVR_DEVICECERT
     registerDeviceCert();
+#endif
     registerVsync();
     ::android::hardware::joinRpcThreadpool();
 }

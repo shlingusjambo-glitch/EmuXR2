@@ -1,7 +1,8 @@
 // Interface declarations for vendor.oculus.hardware.graphics.composer@1.0/1.1, matching the generated code in the
 // interface libraries of the user's firmware (method order from BpHwComposer's vtable, types from BnHwComposer's
 // parcel reads/writes; see vtable.py and hidlsig.py). The libraries themselves come from the user's
-// firmware at setup time and are never shipped.
+// firmware at setup time and are never shipped. MACVR_COMPOSER_REV 2 (v64 on; hal/build.sh picks it when the library
+// has setBroMatrix) appends IComposer@1.1::setBroMatrix.
 #pragma once
 #include <android/hidl/base/1.0/IBase.h>
 #include <hidl/HidlSupport.h>
@@ -36,6 +37,7 @@ namespace V1_1 {
 enum class Device : uint8_t {};
 struct BacklightMatrix;
 struct SpiMessage;
+struct BroMatrix;
 struct IComposer : public V1_0::IComposer {
     static const char* descriptor;
     using getRefreshRates_cb = std::function<void(const hidl_vec<int32_t>&)>;
@@ -53,6 +55,9 @@ struct IComposer : public V1_0::IComposer {
     virtual Return<int64_t> sendBluDebugSpiMessage(const SpiMessage& m, Device d) = 0;
     virtual Return<void> getBacklightMatrix(Device d, getBacklightMatrix_cb cb) = 0;
     virtual Return<void> getBroMatrix(Device d, getBroMatrix_cb cb) = 0;
+#if MACVR_COMPOSER_REV >= 2
+    virtual Return<int64_t> setBroMatrix(Device d, const BroMatrix& m) = 0;
+#endif
     MACVR_IBASE_OVERRIDES
 };
 }

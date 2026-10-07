@@ -75,7 +75,7 @@ Measured in the emulator on an M4 Mac (16 GB) with VrApi's own frame counter.
 ## Quick start
 
 ```sh
-# build the bootable disk from your firmware, then boot (headless; WINDOW=1 shows the emulator window)
+# build the bootable disk from your firmware, then boot (HEADLESS=1 hides the emulator window)
 ./patch.sh ~/MacVRFirmware ~/Library/Android/sdk/system-images/android-32/google_apis/arm64-v8a/system.img
 ./boot.sh
 

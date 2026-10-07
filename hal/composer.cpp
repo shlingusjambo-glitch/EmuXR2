@@ -25,6 +25,9 @@ struct MacVRComposer : public IComposer {
     Return<int64_t> sendBluDebugSpiMessage(const SpiMessage&, Device) override { return 0; }
     Return<void> getBacklightMatrix(Device, getBacklightMatrix_cb cb) override { cb({}); return {}; }
     Return<void> getBroMatrix(Device, getBroMatrix_cb cb) override { cb({}); return {}; }
+#if MACVR_COMPOSER_REV >= 2
+    Return<int64_t> setBroMatrix(Device, const BroMatrix&) override { return 0; }
+#endif
 };
 
 void registerComposer() {

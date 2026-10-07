@@ -23,6 +23,33 @@ python3 tools/ota_check.py <dir with img/>   # read-only: lists what still holds
 Everything else is version-independent: the Vulkan and GLES shims (`vk/`, `egl/`) wrap Android interfaces, the stream
 (`bridge/`) only needs the compositor's stamp and the display, and the host side doesn't look at Horizon at all.
 
+## Building another version beside v54
+
+```sh
+tools/extract_fs.sh ~/MacVRFirmware64            # after payload-dumper-go into ~/MacVRFirmware64/img
+cp -cR ~/MacVRFirmware/{aosp,angle} ~/MacVRFirmware64/          # emulator-side caches, version independent
+./patch.sh ~/MacVRFirmware64 ~/Library/Android/sdk/system-images/android-32/google_apis/arm64-v8a/system.img
+# its own emulator profile (a copy-on-write clone of v54's, so v54's user data is never touched); sysdir likewise
+cd ~/.android/avd && cp -cR horizon.avd horizon64.avd && sed s/horizon.avd/horizon64.avd/ horizon.ini > horizon64.ini
+EMUXR2_FIRMWARE=~/MacVRFirmware64 EMUXR2_AVD=horizon64 ./boot.sh
+```
+
+Meta revises some HAL interfaces without changing their version number. Diff each interface library's `BpHw*` vtables
+(`vtable.py`) and `BnHw*` stubs (`hidlsig.py`) against the previous firmware's; `hal/build.sh` picks the layout by a
+method only the newer revision has (`MACVR_SENSORS_REV`, `MACVR_COMPOSER_REV`).
+
+### v64 (50837850062000150) status
+
+Works: boot, the sensors (revision 2) and composer (revision 2) stand-ins, tracking service (new DSP entry points in
+`compat/hexagon.c`), the VR runtime and the new home environment (it needs `VK_KHR_depth_stencil_resolve`, which
+`vk/` now claims to Meta's apps). Open:
+- The display comes out as two 800-pixel-wide eyes, upside down: v64's compositor takes the display layout from
+  somewhere new (it loads the flat mesh, but the panel geometry differs). Next step: find the source of its display
+  size and scan-out orientation.
+- The device certificate HAL's native library is gone but `com.oculus.companion.server` still asks for it through Java
+  and crash-loops; needs a stand-in that doesn't link Meta's library.
+- Unknown Sources: OCMS no longer has `q4b_kiosk_enabled`.
+
 ## What depends on the host (Mac)
 
 | Piece | Mac assumption | Linux / Windows |

@@ -135,7 +135,12 @@ struct Stream : ICameraStream {
     uint32_t type;
     explicit Stream(uint32_t t) : type(t) {}
     Return<void> getMetadata(getMetadata_cb cb) override { ALOGI("sensors: stream %u %s", type, "getMetadata"); Zero<> z; cb(Result::OK, z.as<CameraStreamMetadata>()); return {}; }
-    Return<Result> writeSessionOcalData(const hidl_vec<uint8_t>&) override { ALOGI("sensors: stream %u %s", type, "writeSessionOcalData"); return Result::OK; }
+#if MACVR_SENSORS_REV >= 2
+    Return<Result> writeSessionOcalData(const hidl_string&, const hidl_vec<uint8_t>&) override {
+#else
+    Return<Result> writeSessionOcalData(const hidl_vec<uint8_t>&) override {
+#endif
+        ALOGI("sensors: stream %u %s", type, "writeSessionOcalData"); return Result::OK; }
     Return<void> prepareStream(const sp<ISensorClient>&, const MQ<FrameSet>& q, const FmqConfig& f, prepareStream_cb cb) override { ALOGI("sensors: stream %u %s", type, "prepareStream"); cb(Result::OK, q, f); return {}; }
     // CameraStreamConfiguration starts with a hidl_vec of 112-byte per-sensor entries (writeEmbeddedToParcel in the
     // interface library); the Quest 2 has four tracking cameras
@@ -151,14 +156,20 @@ struct Stream : ICameraStream {
     Return<Result> stopOverridingExposureSettings(const sp<ISensorClient>&) override { ALOGI("sensors: stream %u %s", type, "stopOverridingExposureSettings"); return Result::OK; }
     Return<void> setExposureGain(const sp<ISensorClient>&, const ExposureGainSettings&) override { ALOGI("sensors: stream %u %s", type, "setExposureGain"); return {}; }
     Return<void> setPhaseOffset(uint64_t) override { ALOGI("sensors: stream %u %s", type, "setPhaseOffset"); return {}; }
+#if MACVR_SENSORS_REV < 2
     Return<uint32_t> getFrameRate() override { ALOGI("sensors: stream %u %s", type, "getFrameRate"); return 30; }
+#endif
     Return<Result> setCameraSyncMode(CameraSyncMode) override { ALOGI("sensors: stream %u %s", type, "setCameraSyncMode"); return Result::OK; }
     Return<Result> setResolution(const hidl_vec<Resolution>&) override { ALOGI("sensors: stream %u %s", type, "setResolution"); return Result::OK; }
 };
 struct StreamController : ICameraStreamController {
     Return<Result> startOverridingExposureSettings() override { return Result::OK; }
     Return<Result> stopOverridingExposureSettings() override { return Result::OK; }
+#if MACVR_SENSORS_REV >= 2
+    Return<Result> setExposureGain(uint8_t, uint32_t, const ExposureGainSettings&) override { return Result::OK; }
+#else
     Return<void> setExposureGain(uint8_t, uint32_t, const ExposureGainSettings&) override { return {}; }
+#endif
 };
 static sp<ICameraStream> streamFor(uint32_t t) {
     static std::mutex m; static std::map<uint32_t, sp<ICameraStream>> all;
@@ -181,25 +192,43 @@ struct Camera : ICameraProvider {
         cb(Result::OK, hidl_handle(h));
         native_handle_close(h); native_handle_delete(h);
         return {}; }
+#if MACVR_SENSORS_REV >= 2
+    Return<void> applyMuxModeByName(const hidl_string& a, const hidl_string& b, status_cb cb) override { ALOGI("sensors: mux mode %s/%s", a.c_str(), b.c_str()); cb(Result::OK, 0); return {}; }
+    Return<void> applyMuxMode(const hidl_string& m, uint8_t, status_cb cb) override { ALOGI("sensors: mux mode %s", m.c_str()); cb(Result::OK, 0); return {}; }
+    Return<void> registerMuxModeTransitionCallback(const sp<ICameraProviderClient>&, const hidl_string&, const sp<IMuxModeTransitionCallback>&) override { return {}; }
+#else
     Return<Result> applyMuxMode(const hidl_string& m, uint8_t) override { ALOGI("sensors: mux mode %s", m.c_str()); return Result::OK; }
+#endif
     Return<sp<ICameraStream>> getStream(FrameType t) override { ALOGI("sensors: camera stream %u requested", (unsigned)t); return streamFor((uint32_t)t); }
     Return<sp<ICameraStream>> getStreamByPurpose(const hidl_string& a, const hidl_string& b) override {
         ALOGI("sensors: camera stream for %s/%s requested", a.c_str(), b.c_str()); return streamFor(1000 + std::hash<std::string>()(std::string(a) + "/" + std::string(b)) % 1000); }
     Return<sp<ICameraStreamController>> getStreamController(const hidl_string&, const hidl_string&) override { static sp<StreamController> c = new StreamController; return c; }
     Return<Result> controlStreams(const hidl_vec<sp<ICameraStreamControlTarget>>&, StreamCommand) override { return Result::OK; }
     Return<UtilityFrequency> getUtilityFrequency() override { return UtilityFrequency(0); }
+#if MACVR_SENSORS_REV >= 2
+    Return<void> setUtilityFrequency(UtilityFrequency, status_cb cb) override { cb(Result::OK, 0); return {}; }
+    Return<Result> setMipiClockRate(const hidl_string&, MipiClockRate) override { return Result::OK; }
+#else
     Return<Result> setUtilityFrequency(UtilityFrequency) override { return Result::OK; }
+#endif
     Return<void> getChannels(getChannels_cb cb) override { Zero<> z; cb(z.as<ChannelSettings>()); return {}; }
     Return<Result> setChannels(const ChannelSettings&) override { return Result::OK; }
     Return<Result> setFrameRate(const FrameRateSettings&) override { return Result::OK; }
     Return<bool> getRawImageMode() override { return false; }
+#if MACVR_SENSORS_REV >= 2
+    Return<void> getCameraMuxModeConfig(getCameraMuxModeConfig_cb cb) override { cb(Result::OK, ""); return {}; }
+#endif
 };
 
 #define STREAM(name, T) Return<Result> name(const MQ<T>&, const sp<ISensorClient>&, const FmqConfig&) override { return Result::OK; }
 struct StreamingClient : IControllerStreamingClient {
     Return<void> dispose() override { return {}; }
     // the controller manager only needs a document to hand on (its tracking comes from injection, not the IMU)
+#if MACVR_SENSORS_REV >= 2
+    Return<void> getCalibrationData(const ControllerAddr&, CalibrationCachePolicy, getCalibrationData_cb cb) override {
+#else
     Return<void> getCalibrationData(const ControllerAddr&, getCalibrationData_cb cb) override {
+#endif
         ControllerCalibrationData d{}; d.json = touchJson(); cb(d); return {}; }
     Return<void> enable(const ControllerAddr&) override { return {}; }
     Return<void> disable(const ControllerAddr&) override { return {}; }
@@ -280,7 +309,11 @@ struct Controllers : IControllerProvider {
     Return<void> getHostInfo(getHostInfo_cb cb) override { Zero<> z; cb(z.as<SecureHostInfo>()); return {}; }
     Return<bool> allowDevice(const SecureDeviceInfo&) override { return true; }
     Return<sp<IControllerManagementClient>> getManagementClient() override { return new ManagementClient; }
+#if MACVR_SENSORS_REV >= 2
+    Return<sp<IControllerStreamingClient>> getStreamingClient(const sp<ISensorClient>&) override { return new StreamingClient; }
+#else
     Return<sp<IControllerStreamingClient>> getStreamingClient() override { return new StreamingClient; }
+#endif
     Return<Result> prepareStateStream(const MQ<PairedControllerInfo>& d, const sp<ISensorClient>&, const FmqConfig& f) override {
         auto s = std::make_shared<StateStream>();
         s->q.reset(new MessageQueue<PairedControllerInfo, kSynchronizedReadWrite>(d));
@@ -299,6 +332,9 @@ struct Controllers : IControllerProvider {
     STREAM(preparePrecisionPadStream, PrecisionPadData) STREAM(prepareMultiTouchStream, MultiTouchData)
     STREAM(prepareStylusStream, StylusData) STREAM(prepareStatsStream, WirelessDeviceStats) STREAM(preparePoseStream, PoseInput)
     STREAM(prepareInputADCStream, ControllerInputADCData) STREAM(prepareCollisionEventStream, ControllerCollisionEvent)
+#if MACVR_SENSORS_REV >= 2
+    STREAM(prepareAlertsStream, ControllerAlerts) STREAM(prepareHidInputStream, HidInput)
+#endif
 };
 
 template <typename Base, typename Data> struct Motion : Base {

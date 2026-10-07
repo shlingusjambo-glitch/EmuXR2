@@ -264,8 +264,17 @@ static void *workerMain(void *u) {
 // (VK_KHR_multiview is core in 1.1; the guest driver supports it but does not list the name, which ANGLE checks for)
 // VK_EXT_line_rasterization is only claimed (Bresenham lines) because ANGLE exposes GL_OVR_multiview only with it;
 // lines are rasterized however the host driver draws them by default.
+// VK_KHR_depth_stencil_resolve is required by newer Horizon home environments (v64's shellenv won't create a device
+// without it); render passes 2 become v1 here, which has no depth resolve, so a resolve attachment keeps its contents.
+// Claimed only to Meta's own apps (com.oculus.*), so games keep the extension list they always had.
+// ponytail: depth resolve not performed; add a sample-0 copy at the end of the subpass if something reads it back
+static int metaApp(void) {
+    static int v = -1;
+    if (v < 0) { char n[64] = {0}; FILE *f = fopen("/proc/self/cmdline", "r"); if (f) { fread(n, 1, sizeof n - 1, f); fclose(f); } v = !strncmp(n, "com.oculus.", 11); }
+    return v;
+}
 static const char *emulated[] = {VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME, VK_KHR_MULTIVIEW_EXTENSION_NAME,
-    VK_EXT_LINE_RASTERIZATION_EXTENSION_NAME};
+    VK_EXT_LINE_RASTERIZATION_EXTENSION_NAME, VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME};
 
 // ---- instance level ----
 static VkResult EnumerateDeviceExtensionProperties(VkPhysicalDevice pd, const char *layer, uint32_t *count, VkExtensionProperties *props) {
@@ -278,6 +287,7 @@ static VkResult EnumerateDeviceExtensionProperties(VkPhysicalDevice pd, const ch
     for (unsigned k = 0; k < sizeof emulated / sizeof *emulated; k++) {
         int have = 0;
         for (uint32_t i = 0; i < n; i++) if (!strcmp(all[i].extensionName, emulated[k])) have = 1;
+        if (!strcmp(emulated[k], VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME) && !metaApp()) have = 1;
         if (!have) { memset(&all[n], 0, sizeof *all); strcpy(all[n].extensionName, emulated[k]); all[n].specVersion = 1; n++; }
     }
     VkResult r = VK_SUCCESS;
@@ -387,6 +397,16 @@ static void GetPhysicalDeviceFeatures2(VkPhysicalDevice pd, VkPhysicalDeviceFeat
     if (v) v->hostQueryReset = VK_FALSE;
     VkPhysicalDeviceLineRasterizationFeaturesEXT *l = (void *)find(out->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES_EXT);
     if (l) { memset(&l->rectangularLines, 0, 6 * sizeof(VkBool32)); l->bresenhamLines = VK_TRUE; }
+}
+// the depth resolve modes behind the claimed VK_KHR_depth_stencil_resolve
+static void GetPhysicalDeviceProperties2(VkPhysicalDevice pd, VkPhysicalDeviceProperties2 *out) {
+    PFN_vkGetPhysicalDeviceProperties2 f = (void *)IPA("vkGetPhysicalDeviceProperties2");
+    if (!f) f = (void *)IPA("vkGetPhysicalDeviceProperties2KHR");
+    VkPhysicalDeviceDepthStencilResolveProperties *ds = (void *)find(out->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES);
+    VkBaseOutStructure *l = ds ? unlink_(out, ds) : NULL;
+    f(pd, out);
+    relink(l, ds);
+    if (ds && metaApp()) { ds->supportedDepthResolveModes = ds->supportedStencilResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT; ds->independentResolveNone = VK_TRUE; ds->independentResolve = VK_FALSE; }
 }
 static VkResult GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice pd, const VkPhysicalDeviceImageFormatInfo2 *info, VkImageFormatProperties2 *out) {
     PFN_vkGetPhysicalDeviceImageFormatProperties2 f = (void *)IPA("vkGetPhysicalDeviceImageFormatProperties2");
@@ -1222,6 +1242,8 @@ static PFN_vkVoidFunction GetInstanceProcAddr(VkInstance inst, const char *n) {
     HOOK("vkGetPhysicalDeviceExternalBufferPropertiesKHR", GetPhysicalDeviceExternalBufferProperties);
     HOOK("vkGetPhysicalDeviceImageFormatProperties2", GetPhysicalDeviceImageFormatProperties2);
     HOOK("vkGetPhysicalDeviceFeatures2", GetPhysicalDeviceFeatures2);
+    HOOK("vkGetPhysicalDeviceProperties2", GetPhysicalDeviceProperties2);
+    HOOK("vkGetPhysicalDeviceProperties2KHR", GetPhysicalDeviceProperties2);
     HOOK("vkGetPhysicalDeviceFeatures2KHR", GetPhysicalDeviceFeatures2);
     HOOK("vkGetPhysicalDeviceImageFormatProperties2KHR", GetPhysicalDeviceImageFormatProperties2);
     PFN_vkVoidFunction h = deviceHook(n);
