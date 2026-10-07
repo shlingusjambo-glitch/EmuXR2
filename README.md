@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/banner.svg" alt="EmuXR2" width="100%">
+  <img src="docs/icon.png" alt="EmuXR2" width="399">
 </p>
 
 <p align="center">
