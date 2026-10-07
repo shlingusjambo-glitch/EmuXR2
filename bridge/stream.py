@@ -466,6 +466,8 @@ def brightness_gain():
 
 class Session:
     def __init__(self, client, display, guest):
+        self.enc_lock = threading.Lock()   # the encoder thread's emit against configure() replacing the encoder
+        self.slot, self.slot_cv, self.enc_error = None, threading.Condition(), None
         self.client, self.display, self.guest = client, display, guest
         self.audio_thread = None
         self.gain = 1.0
@@ -504,6 +506,10 @@ class Session:
         return buf
 
     def configure(self, hello):
+        with self.enc_lock:
+            self._configure(hello)
+
+    def _configure(self, hello):
         log('HELLO:', json.dumps(hello))
         try:
             prof, config = negotiate(hello)
@@ -693,7 +699,43 @@ class Session:
                 pass
             reader.join(timeout=3)
 
+    def submit(self, pixels, when):
+        """Hand a frame to the encoder thread; a frame it hasn't started yet is replaced by the newer one, so capture
+        runs while the previous frame encodes (one thread for both topped out near 60 fps)."""
+        if self.enc_error:
+            raise self.enc_error
+        with self.slot_cv:
+            self.slot = (pixels, when)
+            self.slot_cv.notify()
+
+    def _encode_loop(self):
+        while True:
+            with self.slot_cv:
+                while self.slot is None and not self.stop:
+                    self.slot_cv.wait(0.1)
+                if self.slot is None:
+                    return
+                pixels, when = self.slot
+                self.slot = None
+            try:
+                with self.enc_lock:
+                    self.emit(pixels, when)
+            except Exception as e:   # the capture loop raises it, as it did when it encoded itself
+                self.enc_error = e
+                return
+
     def _run(self):
+        encoder = threading.Thread(target=self._encode_loop, daemon=True)
+        encoder.start()
+        try:
+            self._capture_loop()
+        finally:
+            self.stop = True
+            with self.slot_cv:
+                self.slot_cv.notify()
+            encoder.join(timeout=3)
+
+    def _capture_loop(self):
         last, sent_seq, sent_sig, sent_at, n, t0, skipped = None, None, None, 0.0, 0, time.monotonic(), {}
         last_when = 0
         last_pixels = None   # last encoded frame, re-sent while the display is frozen
@@ -739,7 +781,7 @@ class Session:
                             continue
                         hide_stamp(cur)
                         last_pixels = cur
-                    self.emit(last_pixels, last_when)
+                    self.submit(last_pixels, last_when)
                     sent_at, behind, n = now, 0, n + 1
                 else:
                     time.sleep(0.001)
@@ -765,7 +807,7 @@ class Session:
                     skipped[why] = skipped.get(why, 0) + 1
                     continue
                 hide_stamp(img)
-                self.emit(img, when)
+                self.submit(img, when)
                 last_pixels = img
                 last_when = when
                 sent_seq, sent_sig, sent_at = seq, sig.copy(), now
