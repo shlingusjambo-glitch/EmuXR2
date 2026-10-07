@@ -40,15 +40,17 @@ method only the newer revision has (`MACVR_SENSORS_REV`, `MACVR_COMPOSER_REV`).
 
 ### v64 (50837850062000150) status
 
-Works: boot, the sensors (revision 2) and composer (revision 2) stand-ins, tracking service (new DSP entry points in
-`compat/hexagon.c`), the VR runtime and the new home environment (it needs `VK_KHR_depth_stencil_resolve`, which
-`vk/` now claims to Meta's apps). Open:
-- The display comes out as two 800-pixel-wide eyes, upside down: v64's compositor takes the display layout from
-  somewhere new (it loads the flat mesh, but the panel geometry differs). Next step: find the source of its display
-  size and scan-out orientation.
-- The device certificate HAL's native library is gone but `com.oculus.companion.server` still asks for it through Java
-  and crash-loops; needs a stand-in that doesn't link Meta's library.
-- Unknown Sources: OCMS no longer has `q4b_kiosk_enabled`.
+Works: boot, home environment, Library with Unknown Sources, universal menu over games, Gorilla Tag (73 fps) and Ape
+Sprint, streaming to the headset. What v64 needed:
+- Display: v64's compositor lays the eyes out for a landscape display, so the v64 firmware dir holds `lcd` =
+  `2560x1600` (boot.sh reads it; v54 keeps the portrait default). The stream takes any orientation.
+- HAL interfaces revised in place (sensors, composer: revision 2, picked by hal/build.sh).
+- Device certificate: its native library is gone but Meta's companion and device-auth services still call it;
+  `input/DeviceCert.java` serves it (v64's method layout, one method added before createNonce).
+- Tracking engine: 86 new DSP entry points (`compat/hexagon.c`).
+- Home environment: needs `VK_KHR_depth_stencil_resolve` (claimed to Meta's apps by `vk/`).
+- Unknown Sources: kiosk mode moved from the `q4b_kiosk_enabled` preference to OCMS's app restrictions
+  (`KIOSK_ENABLED`), and the Library has an `update_type` column VrShell needs set (`UNSET`).
 
 ## What depends on the host (Mac)
 

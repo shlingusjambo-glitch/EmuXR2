@@ -40,9 +40,12 @@ PY
 export ANDROID_SDK_ROOT=~/Library/Android/sdk
 # AVD tuning: the address-space graphics transport (a ring buffer; the default pipe makes every Vulkan call a
 # blocking round trip), a 72 Hz display like the Quest's, 6 vCPUs (Meta's runtime expects big cores 4+), and a
-# 2560x1600 panel: the stream's capture is drawn on it, 1280x1600 per eye (the shape of Horizon's eye images)
+# 2560x1600 panel: the stream's capture is drawn on it, 1280x1600 per eye (the shape of Horizon's eye images).
+# v54's compositor draws it on a portrait 1600x2560 display; later ones (v64) need it landscape: the firmware dir's
+# "lcd" file (or EMUXR2_LCD) says which, as WIDTHxHEIGHT
+LCD=${EMUXR2_LCD:-$(cat "$FW/lcd" 2>/dev/null || echo 1600x2560)}
 AVD=~/.android/avd/$AVDNAME.avd/config.ini
-for kv in "hw.gltransport=asg" "hw.lcd.vsync=72" "hw.cpu.ncore=6" "hw.lcd.width=1600" "hw.lcd.height=2560"; do
+for kv in "hw.gltransport=asg" "hw.lcd.vsync=72" "hw.cpu.ncore=6" "hw.lcd.width=${LCD%x*}" "hw.lcd.height=${LCD#*x}"; do
     k=${kv%%=*}; v=${kv#*=}
     if grep -q "^$k" "$AVD"; then sed -i '' "s/^$k.*/$k = $v/" "$AVD"; else echo "$k = $v" >> "$AVD"; fi
 done

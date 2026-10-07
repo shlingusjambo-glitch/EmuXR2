@@ -6,13 +6,14 @@ mkdir -p "$HERE/out"
 "$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang" --target=aarch64-linux-android31 \
     -Wall -Wextra -O2 "$HERE/vmouse.c" -o "$HERE/out/vinput"
 # In-guest Java helpers, run with app_process as root (javac + d8: the NDK's binder stub lacks AServiceManager):
-# Injector (head poses into TrackingDataInjection) and Audio (the guest's sound).
+# Injector (head poses into TrackingDataInjection), Audio (the guest's sound) and DeviceCert (the device certificate
+# HAL, for firmware without its native library).
 # Hidden framework classes are compiled against stubs/ and resolved from the boot classpath at run time.
 export JAVA_HOME=${JAVA_HOME:-/opt/homebrew/opt/openjdk@21}   # d8 needs it too
 JDK=$JAVA_HOME
 ANDROID_JAR=$(ls "$HOME/Library/Android/sdk/platforms/android-"*/android.jar | sort -V | tail -n 1)
 D8=$(ls -d "$HOME/Library/Android/sdk/build-tools/"*/d8 | sort -V | tail -n 1)
-for c in Injector Audio; do
+for c in Injector Audio DeviceCert; do
     rm -rf "$HERE/out/$c" && mkdir -p "$HERE/out/$c"
     set -- "$HERE/$c.java"
     if [ "$c" = Injector ]; then set -- "$@" "$HERE/LatestPacketInput.java" "$HERE/HomeButton.java"; fi

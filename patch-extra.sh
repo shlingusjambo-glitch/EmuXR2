@@ -17,10 +17,15 @@ put emu/emu_vendor.img "$H/hal/out/macvr-hal" /bin/hw/macvr-hal u:object_r:hal_g
 $D -w -R "set_inode_field /bin/hw/macvr-hal mode 0100755" emu/emu_vendor.img >/dev/null 2>&1
 for l in $(cd fs/vendor/lib64 && ls vendor.oculus.*.so); do put emu/emu_vendor.img fs/vendor/lib64/$l /lib64/$l u:object_r:vendor_file:s0; done
 put emu/emu_vendor.img "$H/hal/macvr-hal.rc" /etc/init/macvr-hal.rc u:object_r:vendor_configs_file:s0
-# (without the device certificate HAL when the firmware no longer has it: hal/build.sh then leaves it out)
-python3 -c "import re, sys; m = open(sys.argv[1]).read(); print(m if sys.argv[2] == '1' else re.sub(r'\s*<hal format=\"hidl\">\s*<name>vendor\.oculus\.hardware\.devicecert</name>.*?</hal>', '', m, flags=re.S), end='')" \
-    "$H/hal/macvr-hal.xml" "$([ -f fs/vendor/lib64/vendor.oculus.hardware.devicecert@1.0.so ] && echo 1)" > work/macvr-hal.xml
-put emu/emu_vendor.img work/macvr-hal.xml /etc/vintf/manifest/macvr-hal.xml u:object_r:vendor_configs_file:s0
+put emu/emu_vendor.img "$H/hal/macvr-hal.xml" /etc/vintf/manifest/macvr-hal.xml u:object_r:vendor_configs_file:s0
+# the device certificate HAL: macvr-hal serves it where the firmware has its interface library (v54); where that's gone
+# (v64) Meta's companion service still asks for it, so a Java stand-in speaking HIDL's parcels directly serves it
+if [ ! -f fs/vendor/lib64/vendor.oculus.hardware.devicecert@1.0.so ]; then
+    "$H/input/build.sh" >/dev/null
+    put work/system.img "$H/input/out/devicecert.dex" /system/etc/macvr-devicecert.dex
+    printf 'service macvr-devicecert /system/bin/app_process /system/bin DeviceCert\n    class main\n    user system\n    group system\n    setenv CLASSPATH /system/etc/macvr-devicecert.dex\n' > work/macvr-devicecert.rc
+    put work/system.img work/macvr-devicecert.rc /system/etc/init/macvr-devicecert.rc
+fi
 # Vulkan: MacVR's HAL wrapper over the emulator driver adds VK_KHR_external_memory_fd (over AHardwareBuffer),
 # which Meta's runtime uses to share swapchain images
 "$H/vk/build.sh" "$W" >/dev/null

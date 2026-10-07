@@ -73,7 +73,7 @@ def main():
         newer = sorted(l for l in libs if l.startswith(name + '@') and ver(l) > tuple(map(int, version.split('.'))))
         report(f'HAL {name}@{version}', lib in libs,
                ('also ' + ', '.join(newer) + ': regenerate signatures (hidlsig.py, vtable.py) and extend hal/') if newer else
-               ('' if lib in libs else 'interface library gone: hal/build.sh leaves its stand-in out; check nothing still asks for it'))
+               ('' if lib in libs else 'interface library gone: served by input/DeviceCert.java instead (check its method layout, read from a client)'))
 
     # the VR runtime: the properties and symbols EmuXR2 relies on
     rt = apk_strings(img['system'], '/system/priv-app/VrDriver/VrDriver.apk', r'arm64-v8a/libvrruntimeservice\.so$')

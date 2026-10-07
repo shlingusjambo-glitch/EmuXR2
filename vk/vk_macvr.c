@@ -210,7 +210,6 @@ static void freeShared(Shared *s) {
     }
     if (s->gen) munmap((void *)s->gen, 4096);
     if (s->genFd >= 0) close(s->genFd);
-    for (int i = 0; i < MAXSHARED; i++) if (shared[i] == s) shared[i] = NULL;
     free(s);
 }
 
@@ -540,7 +539,11 @@ static void DestroyImage(VkDevice dev, VkImage im, const VkAllocationCallbacks *
       if (m) { if (m->cb) dd->FreeCommandBuffers(dev, dd->pool[m->family], 1, &m->cb); memset(m, 0, sizeof *m); }
       pthread_mutex_unlock(&lock); }
     Dev *d = findDev(dev);
-    pthread_mutex_lock(&lock); Shared *s = byImage(im); pthread_mutex_unlock(&lock);
+    // off the list under the lock before it's torn down: submits on other threads walk the list (and read each
+    // image's shared generation counter, which freeShared unmaps) under the lock
+    pthread_mutex_lock(&lock); Shared *s = byImage(im);
+    if (s) for (int i = 0; i < MAXSHARED; i++) if (shared[i] == s) shared[i] = NULL;
+    pthread_mutex_unlock(&lock);
     if (s) { if (d->lastExt == im) d->lastExt = VK_NULL_HANDLE; freeShared(s); }
     d->DestroyImage(dev, im, a);
 }
