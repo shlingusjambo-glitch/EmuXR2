@@ -4,7 +4,7 @@
 
 <p align="center">
   <img alt="Platform: macOS on Apple silicon" src="https://img.shields.io/badge/platform-macOS%20%C2%B7%20Apple%20silicon-black">
-  <img alt="Guest: Horizon OS v54" src="https://img.shields.io/badge/guest-Horizon%20OS%20v54%20(Quest%202)-3a7bea">
+  <img alt="Guest: Horizon OS v54 and v64" src="https://img.shields.io/badge/guest-Horizon%20OS%20v54%20%7C%20v64%20(Quest%202)-3a7bea">
   <img alt="License: GPL-3.0" src="https://img.shields.io/badge/license-GPL--3.0-ff5b6e">
 </p>
 
@@ -13,13 +13,13 @@ software (the home environment, system UI, panels, Library and apps) unmodified 
 and streams it to a real Quest headset over USB, so you can use old Horizon OS versions and play Quest games
 from your Mac.
 
-> **Status:** Horizon OS v54 boots to Meta's home environment and streams to a Quest 2 in stereo with head
+> **Status:** Horizon OS v54 and v64 boot to Meta's home environment and streams to a Quest 2 in stereo with head
 > and controller tracking. The universal menu opens over running games, sideloaded games launch from
 > Library's Unknown Sources, and games run online (Photon, PlayFab). Gorilla Tag holds 72 fps; Ape Sprint
 > runs at 41–55 fps. Next: steadier frame rates in heavy scenes and smoother head turns. See
 > [PROGRESS.md](PROGRESS.md).
 
-You'll need a V54 OTA.
+You'll need a V54 or V64 OTA.
 
 ## Screenshots
 
@@ -76,8 +76,12 @@ Measured in the emulator on an M4 Mac (16 GB) with VrApi's own frame counter.
 
 ```sh
 # build the bootable disk from your firmware, then boot (HEADLESS=1 hides the emulator window)
+tools/extract_fs.sh ~/MacVRFirmware
 ./patch.sh ~/MacVRFirmware ~/Library/Android/sdk/system-images/android-32/google_apis/arm64-v8a/system.img
 ./boot.sh
+# v64: its own firmware dir and emulator profile beside v54 (see docs/porting.md), with a landscape display
+echo 2560x1600 > ~/MacVRFirmware64/lcd
+EMUXR2_FIRMWARE=~/MacVRFirmware64 EMUXR2_AVD=horizon64 ./boot.sh
 
 # stream to a Quest connected over USB
 python3 -m venv bridge/.venv
