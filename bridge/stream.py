@@ -126,6 +126,10 @@ def start_guest():
     """(Re)start the pose injector and audio in the guest; their dex files come from input/build.sh."""
     # the guest has no proximity sensor to wake it: asleep, it composes nothing and the stream freezes
     adb('shell', 'dumpsys battery set ac 1; svc power stayon true; input keyevent WAKEUP')
+    # Each pose otherwise emits many debug lines from Meta's injection service (~700/s).
+    # Keep warnings/errors; profiling can restore the detailed tracking diagnostics.
+    tracking_log = 'D' if os.getenv('EMUXR2_PROFILE') == '1' else 'W'
+    adb('shell', f'setprop log.tag.TrackingDataInjection {tracking_log}')
     # no room to guard: Guardian only retries spatial anchors (~15/s), burning CPU and leaking memory
     adb('shell', 'setprop persist.oculus.guardian_disable 1')
     # the brightness slider dims the stream from full: start it at full once (Horizon's default is a third)
