@@ -160,7 +160,11 @@ static int wantsViews(void) {
     for (unsigned i = 0; !v && *dir && i < sizeof vr / sizeof *vr; i++) { char path[600]; snprintf(path, sizeof path, "%s/%s", dir, vr[i]); v = !access(path, F_OK); }
     return v;
 }
-static const char *hidden[] = {"GL_EXT_texture_view"};
+// The emulator decodes ASTC on its GPU, and its decoder writes magenta for some blocks (patches of pink on game
+// textures). Without the extensions Unity decompresses ASTC itself at load.
+static const char *hidden[] = {"GL_EXT_texture_view", "GL_KHR_texture_compression_astc_ldr",
+                               "GL_KHR_texture_compression_astc_hdr", "GL_KHR_texture_compression_astc_sliced_3d",
+                               "GL_OES_texture_compression_astc"};
 const GLubyte *glGetString(GLenum name) {
     static const GLubyte *(*f)(GLenum);
     static __thread char *cache[2]; static __thread const GLubyte *src[2];
