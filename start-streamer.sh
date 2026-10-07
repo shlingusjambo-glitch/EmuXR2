@@ -7,10 +7,11 @@
 set -eu
 H=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 A=${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}/platform-tools/adb
-PY=${EMUXR2_PYTHON:-$H/.venv/bin/python3}
+PY=${EMUXR2_PYTHON:-$H/bridge/.venv/bin/python3}
+[ -x "$PY" ] || PY=$H/.venv/bin/python3
 [ -x "$PY" ] || PY=python3
 command -v "$PY" >/dev/null || { echo "python3 not on PATH" >&2; exit 1; }
-"$PY" -c "import av, numpy" 2>/dev/null || { echo "Missing streamer dependencies. Run: python3 -m venv .venv && .venv/bin/python3 -m pip install av numpy" >&2; exit 1; }
+"$PY" -c "import av, numpy, grpc" 2>/dev/null || { echo "Missing streamer dependencies. Run: python3 -m venv bridge/.venv && bridge/.venv/bin/pip install av numpy grpcio grpcio-tools" >&2; exit 1; }
 echo "waiting for the emulator"
 for i in $(seq 1 60); do
     "$A" -s "${EMUXR2_SERIAL:-emulator-5554}" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' | grep -q '^1$' && break
