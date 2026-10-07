@@ -317,8 +317,15 @@ static void rememberAttach(GLenum target, GLenum att, GLuint tex) {
     for (int i = 0; i < MAXFB; i++) { if (fbTex[i].fb == (GLuint)fb) { slot = i; break; } if (slot < 0 && !fbTex[i].fb) slot = i; }
     if (slot >= 0) { fbTex[slot].fb = fb; fbTex[slot].tex = tex; }
 }
+// framebuffer 0 for Meta's compositor is its front buffer (libEGL_macvr's macvr_FrontFramebuffer)
+static GLuint frontFramebuffer(void) {
+    static GLuint (*front)(void); static int tried;
+    if (!tried) { front = eglShim("macvr_FrontFramebuffer"); tried = 1; }
+    return front ? front() : 0;
+}
 void glBindFramebuffer(GLenum target, GLuint fb) {
     static void (*f)(GLenum, GLuint); if (!f) f = dlsym(RTLD_NEXT, "glBindFramebuffer");
+    if (!fb) fb = frontFramebuffer();
     f(target, fb);
     if (fb && target != GL_READ_FRAMEBUFFER) for (int i = 0; i < MAXFB; i++) if (fbTex[i].fb == fb) { if (fbTex[i].tex) noteAttach(fbTex[i].tex); break; }
 }
@@ -329,6 +336,28 @@ ATTACH(glFramebufferTexture2D, (GLenum t, GLenum a, GLenum tt, GLuint tex, GLint
 ATTACH(glFramebufferTextureLayer, (GLenum t, GLenum a, GLuint tex, GLint l, GLint layer), (t, a, tex, l, layer), tex, "(0x%x, tex %u, layer %d)", a, tex, layer)
 ATTACH(glFramebufferTextureMultiviewOVR, (GLenum t, GLenum a, GLuint tex, GLint l, GLint base, GLsizei n), (t, a, tex, l, base, n), tex, "(0x%x, tex %u, views %d+%d)", a, tex, base, n)
 ATTACH(glFramebufferTextureMultisampleMultiviewOVR, (GLenum t, GLenum a, GLuint tex, GLint l, GLsizei s, GLint base, GLsizei n), (t, a, tex, l, s, base, n), tex, "(0x%x, tex %u, views %d+%d)", a, tex, base, n)
+// a front buffer keeps its pixels: the compositor's invalidations of framebuffer 0 (meant for a tiler's window) are
+// dropped there, as their default-framebuffer attachment names don't apply to a texture
+static int frontBound(GLenum target) {
+    GLuint front = frontFramebuffer(); GLint fb = 0;
+    if (!front) return 0;
+    glGetIntegerv(target == GL_READ_FRAMEBUFFER ? GL_READ_FRAMEBUFFER_BINDING : GL_DRAW_FRAMEBUFFER_BINDING, &fb);
+    return (GLuint)fb == front;
+}
+void glInvalidateFramebuffer(GLenum target, GLsizei n, const GLenum *att) {
+    static void (*f)(GLenum, GLsizei, const GLenum *); if (!f) f = dlsym(RTLD_NEXT, "glInvalidateFramebuffer");
+    if (!frontBound(target)) f(target, n, att);
+}
+void glDiscardFramebufferEXT(GLenum target, GLsizei n, const GLenum *att) {
+    static void (*f)(GLenum, GLsizei, const GLenum *); if (!f) f = dlsym(RTLD_NEXT, "glDiscardFramebufferEXT");
+    if (f && !frontBound(target)) f(target, n, att);
+}
+// the window's colour buffer (GL_BACK, GL_FRONT or GL_COLOR) is the front buffer texture's attachment
+void glGetFramebufferAttachmentParameteriv(GLenum target, GLenum att, GLenum pname, GLint *v) {
+    static void (*f)(GLenum, GLenum, GLenum, GLint *); if (!f) f = dlsym(RTLD_NEXT, "glGetFramebufferAttachmentParameteriv");
+    if ((att == GL_BACK || att == GL_FRONT || att == 0x1800 /* GL_COLOR */) && frontBound(target)) att = GL_COLOR_ATTACHMENT0;
+    f(target, att, pname, v);
+}
 GLsync glFenceSync(GLenum c, GLbitfield fl) {
     static GLsync (*f)(GLenum, GLbitfield); static void (*flush)(void);
     if (!f) { f = dlsym(RTLD_NEXT, "glFenceSync"); flush = eglShim("macvr_FlushArrays"); }

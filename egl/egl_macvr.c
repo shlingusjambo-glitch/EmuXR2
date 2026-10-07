@@ -76,23 +76,19 @@ EGLSurface eglCreatePbufferSurface(EGLDisplay d, EGLConfig c, const EGLint *attr
 // window surfaces, so a switch to front-buffer rendering can turn on the window's auto-refresh: the Quest compositor
 // draws straight into the front buffer, which its display scans out; on the emulator the buffer goes through
 // SurfaceFlinger, which has to be told to show it again every vsync
-static struct { EGLSurface s; EGLNativeWindowType w; int front, capture; } wins[32];
-// EmuXR2's stream: the runtime's casting capture renders both eyes into a window of the size input/Capture.java
-// announces in debug.emuxr2.capture. It isn't the display, and its frames carry the pose number they were made with.
+static struct { EGLSurface s; EGLNativeWindowType w; int front; } wins[32];
 #include <android/native_window.h>
 #include <sys/system_properties.h>
-static int isCaptureWindow(EGLNativeWindowType w) {
-    char v[PROP_VALUE_MAX] = {0}; int cw = 0, ch = 0;
-    __system_property_get("debug.emuxr2.capture", v);
-    return sscanf(v, "%dx%d", &cw, &ch) == 2 && ANativeWindow_getWidth(w) == cw && ANativeWindow_getHeight(w) == ch;
-}
 static void hookRuntime(void);
 static int isCompositor(void) {
     static int v = -1;
     if (v < 0) { char n[64] = {0}; FILE *f = fopen("/proc/self/cmdline", "r"); if (f) { fread(n, 1, 63, f); fclose(f); } v = !strcmp(n, "com.oculus.vrruntimeservice"); }
     return v;
 }
-// present the compositor's surface (at most every 11 ms) when it makes a fence: its frame (or eye) is drawn
+// present the compositor's surface (at most every 11 ms) when it makes a fence: its frame (both eyes) is drawn
+static void stamp(void);
+static int frontToWindow(void);
+static void frontRebind(void);
 static void present(void) {
     if (!isCompositor()) return;
     EGLSurface s = eglGetCurrentSurface(EGL_DRAW); int front = 0;
@@ -104,7 +100,10 @@ static void present(void) {
     // never wait on SurfaceFlinger: it in turn waits on virtual-display buffers this compositor releases
     static __thread EGLSurface async;
     if (async != s) { ((EGLBoolean (*)(EGLDisplay, EGLint))real("eglSwapInterval"))(eglGetCurrentDisplay(), 0); async = s; LOG("compositor surface %p: swap interval 0", s); }
+    if (!frontToWindow()) return;
+    stamp();
     ((EGLBoolean (*)(EGLDisplay, EGLSurface))real("eglSwapBuffers"))(eglGetCurrentDisplay(), s);
+    frontRebind();
 }
 static void frontBuffer(EGLSurface s) {
     for (int i = 0; i < 32; i++) if (wins[i].s == s) {
@@ -119,9 +118,7 @@ EGLSurface eglCreateWindowSurface(EGLDisplay d, EGLConfig c, EGLNativeWindowType
     for (int i = 0; s != EGL_NO_SURFACE && attr && attr[i] != EGL_NONE; i += 2)
         if (attr[i] == EGL_RENDER_BUFFER && attr[i + 1] == EGL_SINGLE_BUFFER) frontBuffer(s);
     LOG("eglCreateWindowSurface(%p) -> %p (compositor %d)", w, s, isCompositor());
-    int capture = s != EGL_NO_SURFACE && isCompositor() && isCaptureWindow(w);
-    if (capture) { for (int i = 0; i < 32; i++) if (wins[i].s == s) wins[i].capture = 1; LOG("capture surface %p", s); }
-    if (s != EGL_NO_SURFACE && isCompositor() && !capture) {
+    if (s != EGL_NO_SURFACE && isCompositor()) {
         hookRuntime();
         // Meta's compositor swaps once, then keeps drawing into that buffer, which the Quest's display scans out.
         // Here the surface keeps its contents across swaps, and is presented at the compositor's fences (see present).
@@ -141,6 +138,90 @@ static void *gl(const char *n) {
     static __eglMustCastToProperFunctionPointerType (*f)(const char *);
     if (!f) f = real("eglGetProcAddress");
     return (void *)f(n);
+}
+// ---- the compositor's front buffer ----
+// Meta's compositor draws each frame's eyes straight into the window's front buffer, which a Quest's display scans
+// out, and never swaps. The emulator's window is a queue of buffers that trade places at every swap, so drawing into
+// "the" window buffer left old eyes in some of them (frames that showed the head where it was 100 ms earlier). Here
+// the front buffer is a texture of the window's size: framebuffer 0 means it (eglMakeCurrent, and glBindFramebuffer in
+// libGLESv2_macvr), and present() copies it into the window's next buffer and queues that.
+#include <pthread.h>
+static struct { EGLSurface s; GLuint tex; EGLint w, h; } fronts[4];
+static struct { EGLContext c; EGLSurface s; GLuint fbo; } frontFbos[16];
+static pthread_mutex_t frontLock = PTHREAD_MUTEX_INITIALIZER;
+static int isFront(EGLSurface s) {
+    for (int i = 0; i < 32; i++) if (wins[i].s == s && wins[i].front) return 1;
+    return 0;
+}
+// the current context's framebuffer over the current surface's front buffer, or 0 (not the compositor's display)
+__attribute__((visibility("default"))) GLuint macvr_FrontFramebuffer(void) {
+    if (!isCompositor()) return 0;
+    EGLSurface s = eglGetCurrentSurface(EGL_DRAW); EGLContext c = eglGetCurrentContext();
+    if (s == EGL_NO_SURFACE || c == EGL_NO_CONTEXT || !isFront(s)) return 0;
+    GLuint fbo = 0;
+    pthread_mutex_lock(&frontLock);
+    for (int i = 0; i < 16 && !fbo; i++) if (frontFbos[i].c == c && frontFbos[i].s == s) fbo = frontFbos[i].fbo;
+    if (!fbo) {
+        int f = -1;
+        for (int i = 0; i < 4; i++) if (fronts[i].s == s) f = i;
+        GLboolean (*isTex)(GLuint) = gl("glIsTexture");
+        if (f < 0 || !isTex(fronts[f].tex)) {   // first use, or a context outside the share group
+            if (f < 0) for (int i = 0; i < 4 && f < 0; i++) if (!fronts[i].s) f = i;
+            if (f < 0) f = 0;
+            EGLDisplay d = eglGetCurrentDisplay(); EGLint w = 0, h = 0;
+            ((EGLBoolean (*)(EGLDisplay, EGLSurface, EGLint, EGLint *))real("eglQuerySurface"))(d, s, EGL_WIDTH, &w);
+            ((EGLBoolean (*)(EGLDisplay, EGLSurface, EGLint, EGLint *))real("eglQuerySurface"))(d, s, EGL_HEIGHT, &h);
+            GLint prev = 0; ((void (*)(GLenum, GLint *))gl("glGetIntegerv"))(GL_TEXTURE_BINDING_2D, &prev);
+            GLuint t = 0; ((void (*)(GLsizei, GLuint *))gl("glGenTextures"))(1, &t);
+            ((void (*)(GLenum, GLuint))gl("glBindTexture"))(GL_TEXTURE_2D, t);
+            ((void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei))gl("glTexStorage2D"))(GL_TEXTURE_2D, 1, GL_SRGB8_ALPHA8, w, h);   // the compositor insists on an sRGB front buffer
+            ((void (*)(GLenum, GLuint))gl("glBindTexture"))(GL_TEXTURE_2D, prev);
+            fronts[f].s = s; fronts[f].tex = t; fronts[f].w = w; fronts[f].h = h;
+            LOG("front buffer of surface %p: texture %u, %dx%d (context %p)", s, t, w, h, c);
+        }
+        GLint dr = 0, rd = 0; void (*geti)(GLenum, GLint *) = gl("glGetIntegerv"); void (*bind)(GLenum, GLuint) = gl("glBindFramebuffer");
+        geti(GL_DRAW_FRAMEBUFFER_BINDING, &dr); geti(GL_READ_FRAMEBUFFER_BINDING, &rd);
+        ((void (*)(GLsizei, GLuint *))gl("glGenFramebuffers"))(1, &fbo);
+        bind(GL_FRAMEBUFFER, fbo);
+        ((void (*)(GLenum, GLenum, GLenum, GLuint, GLint))gl("glFramebufferTexture2D"))(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fronts[f].tex, 0);
+        bind(GL_DRAW_FRAMEBUFFER, dr); bind(GL_READ_FRAMEBUFFER, rd);
+        int slot = 0;
+        for (int i = 0; i < 16; i++) if (!frontFbos[i].c) { slot = i; break; }
+        frontFbos[slot].c = c; frontFbos[slot].s = s; frontFbos[slot].fbo = fbo;
+    }
+    pthread_mutex_unlock(&frontLock);
+    return fbo;
+}
+// framebuffer 0 for the compositor is its front buffer from the moment its context is current on the display
+EGLBoolean eglMakeCurrent(EGLDisplay d, EGLSurface draw, EGLSurface read, EGLContext ctx) {
+    static EGLBoolean (*f)(EGLDisplay, EGLSurface, EGLSurface, EGLContext); if (!f) f = real("eglMakeCurrent");
+    EGLBoolean r = f(d, draw, read, ctx);
+    if (r && ctx != EGL_NO_CONTEXT && isCompositor()) {
+        GLuint fbo = macvr_FrontFramebuffer();
+        if (fbo) ((void (*)(GLenum, GLuint))gl("glBindFramebuffer"))(GL_FRAMEBUFFER, fbo);
+    }
+    return r;
+}
+static GLint savedDraw, savedRead; static GLboolean savedScissor;
+// copy the front buffer into the window's buffer (bound as framebuffer 0 to draw); 0 when there is none
+static int frontToWindow(void) {
+    GLuint fbo = macvr_FrontFramebuffer();
+    if (!fbo) return 0;
+    EGLSurface s = eglGetCurrentSurface(EGL_DRAW); EGLint w = 0, h = 0;
+    for (int i = 0; i < 4; i++) if (fronts[i].s == s) { w = fronts[i].w; h = fronts[i].h; }
+    void (*geti)(GLenum, GLint *) = gl("glGetIntegerv"); void (*bind)(GLenum, GLuint) = gl("glBindFramebuffer");
+    geti(GL_DRAW_FRAMEBUFFER_BINDING, &savedDraw); geti(GL_READ_FRAMEBUFFER_BINDING, &savedRead);
+    savedScissor = ((GLboolean (*)(GLenum))gl("glIsEnabled"))(GL_SCISSOR_TEST);
+    ((void (*)(GLenum))gl("glDisable"))(GL_SCISSOR_TEST);
+    bind(GL_READ_FRAMEBUFFER, fbo); bind(GL_DRAW_FRAMEBUFFER, 0);
+    ((void (*)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum))gl("glBlitFramebuffer"))
+        (0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    return 1;
+}
+static void frontRebind(void) {
+    void (*bind)(GLenum, GLuint) = gl("glBindFramebuffer");
+    bind(GL_DRAW_FRAMEBUFFER, savedDraw); bind(GL_READ_FRAMEBUFFER, savedRead);
+    if (savedScissor) ((void (*)(GLenum))gl("glEnable"))(GL_SCISSOR_TEST);
 }
 static GLenum bindFor(GLuint tex, GLenum want, GLenum alt, GLint *prev) {
     void (*bind)(GLenum, GLuint) = gl("glBindTexture"); void (*geti)(GLenum, GLint *) = gl("glGetIntegerv"); GLenum (*e)(void) = gl("glGetError");
@@ -553,13 +634,16 @@ __eglMustCastToProperFunctionPointerType eglGetProcAddress(const char *name) {
     if (!f) f = real("eglGetProcAddress");
     if (!strcmp(name,"glMapBufferRange") || !strcmp(name,"glUnmapBuffer") || !strcmp(name,"glGetBufferParameteriv") || !strcmp(name,"glDeleteProgram") || !strcmp(name,"glTexBufferEXT") || !strcmp(name,"glTexBuffer") || !strcmp(name,"glBindTexture") || !strcmp(name,"glActiveTexture") || !strcmp(name,"glBindBuffer") || !strcmp(name,"glBufferData") || !strcmp(name,"glBufferSubData") || !strcmp(name,"glUseProgram") || !strcmp(name,"glUniform1i") || !strcmp(name, "glShaderSource") || !strcmp(name, "glCompileShader") || !strcmp(name, "glGetActiveUniformBlockiv") || !strcmp(name, "glValidateProgram") || !strcmp(name, "glLinkProgram") || !strcmp(name, "glProgramBinary") ||
         !strcmp(name, "glFramebufferTextureMultiviewOVR") || !strcmp(name, "glFramebufferTextureMultisampleMultiviewOVR") ||
-        !strcmp(name, "glBindFramebuffer") || !strcmp(name, "glFenceSync")) {
+        !strcmp(name, "glBindFramebuffer") || !strcmp(name, "glFenceSync") ||
+        !strcmp(name, "glInvalidateFramebuffer") || !strcmp(name, "glDiscardFramebufferEXT") ||
+        !strcmp(name, "glGetFramebufferAttachmentParameteriv")) {
         void *shim = dlopen("libGLESv2_macvr.so", RTLD_NOW | RTLD_NOLOAD);
         void *entry = shim ? dlsym(shim, name) : NULL;
         if (entry) return (__eglMustCastToProperFunctionPointerType)entry;
     }
     if (!strcmp(name, "glEGLImageTargetTexture2DOES")) return (__eglMustCastToProperFunctionPointerType)macvr_ImageTargetTexture2D;
     if (!strcmp(name, "eglCreateContext")) return (__eglMustCastToProperFunctionPointerType)eglCreateContext;
+    if (!strcmp(name, "eglMakeCurrent")) return (__eglMustCastToProperFunctionPointerType)eglMakeCurrent;
     if (!strcmp(name, "eglCreatePbufferSurface")) return (__eglMustCastToProperFunctionPointerType)eglCreatePbufferSurface;
     if (!strcmp(name, "eglCreateWindowSurface")) return (__eglMustCastToProperFunctionPointerType)eglCreateWindowSurface;
     if (!strcmp(name, "glTextureViewOES") || !strcmp(name, "glTextureViewEXT")) return (__eglMustCastToProperFunctionPointerType)macvr_TextureView;
@@ -588,7 +672,7 @@ EGLBoolean eglSurfaceAttrib(EGLDisplay d, EGLSurface s, EGLint attr, EGLint v) {
 }
 static void dumpSwap(EGLDisplay d, EGLSurface s);
 // swaps on window surfaces (logged occasionally)
-// The pose number in effect (written by the guest's pose injector, input/Injector.java) goes into the capture's
+// The pose number in effect (written by the guest's pose injector, input/Injector.java) goes into the display's
 // bottom-left corner as 36 8x8 blocks, white = 1: sync bits 1011, then the 32-bit number, low bit first. The host
 // reads it back to tell the headset exactly which of its poses the frame shows.
 #include <fcntl.h>
@@ -601,13 +685,7 @@ static uint32_t poseNumber(void) {
     }
     return seq ? *seq : 0;
 }
-static void stamp(EGLDisplay d, EGLSurface s) {
-    int capture = 0;
-    for (int i = 0; i < 32; i++) if (wins[i].s == s && wins[i].capture) capture = 1;
-    if (!capture) return;
-    // the compositor thread draws this: never wait on SurfaceFlinger (which waits on this compositor's virtual displays)
-    static __thread EGLSurface async;
-    if (async != s) { ((EGLBoolean (*)(EGLDisplay, EGLint))real("eglSwapInterval"))(d, 0); async = s; LOG("capture surface %p: swap interval 0", s); }
+static void stamp(void) {
     uint64_t bits = 0xDull | (uint64_t)poseNumber() << 4;
     GLboolean (*isOn)(GLenum) = gl("glIsEnabled"); void (*geti)(GLenum, GLint *) = gl("glGetIntegerv");
     void (*getf)(GLenum, GLfloat *) = gl("glGetFloatv"); void (*getb)(GLenum, GLboolean *) = gl("glGetBooleanv");
@@ -623,7 +701,6 @@ static void stamp(EGLDisplay d, EGLSurface s) {
 }
 EGLBoolean eglSwapBuffers(EGLDisplay d, EGLSurface s) {
     static EGLBoolean (*f)(EGLDisplay, EGLSurface); if (!f) f = real("eglSwapBuffers");
-    stamp(d, s);
     dumpSwap(d, s);
     EGLBoolean r = f(d, s);
     static unsigned n; if (n < 3 || n % 500 == 0) LOG("eglSwapBuffers(%p) #%u -> %d (0x%x)", s, n, r, ((EGLint (*)(void))real("eglGetError"))()); n++;
@@ -650,7 +727,6 @@ static void dumpSwap(EGLDisplay d, EGLSurface s) {
 }
 EGLBoolean eglSwapBuffersWithDamageKHR(EGLDisplay d, EGLSurface s, EGLint *rects, EGLint n_) {
     static EGLBoolean (*f)(EGLDisplay, EGLSurface, EGLint *, EGLint); if (!f) f = real("eglSwapBuffersWithDamageKHR");
-    stamp(d, s);
     dumpSwap(d, s);
     EGLBoolean r = f(d, s, rects, n_);
     static unsigned n; if (n < 3 || n % 500 == 0) LOG("eglSwapBuffersWithDamageKHR(%p) #%u -> %d", s, n, r); n++;

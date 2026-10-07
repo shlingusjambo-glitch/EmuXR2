@@ -418,3 +418,26 @@ All currently actionable code/build/deployment and regression checks are complet
   on and files the environments under Environments. Gorilla Tag now lists.
 - Login: the browser opens without one. Store, TV, Chats, People, Explore show errors or loading screens because they
   are Meta's online services and need a Meta account; see the device certificate note above.
+
+### Headset projection continuation (2026-10-07)
+
+- User confirms Unknown Sources works; no changes made to its implementation.
+- Found concrete regression in the new flat-display stream: CONFIG fov held tangents, while the Android client
+  expects XrFovf angles in radians and takes tan() in its shader setup. Changed wire FOV to radians and adjusted
+  calibrate_display intrinsics to convert angles to tangents explicitly. Added regression checks for both eyes.
+- test_stream_config and live_smoke now advertise the fov feature so diagnostics cannot trigger USB client reinstalls.
+- Connected headset is Quest 2 1WMHHA641Q2123. Corrected CONFIG verified sent to it. Physical headset is asleep;
+  wearer confirmation of zoom/stretch/eye overlap is still required. An async question was sent.
+- Baseline synthetic full-resolution/controller test: 744 frames/20 s (37.2 fps), pose age median 97.7 ms, p95 124.2 ms.
+  1280x1408 guest eye buffers gave 761 frames/20 s (38.1 fps), 96.0/119.9 ms. Reverted guest texture overrides.
+- Display calibration with smaller buffers: left fx/fy 590.7/687.9 vs intended 595.2/694.9, right 591.7/687.9; centres
+  within 4 px of intended. Correct geometric FOV is supported to about 1%, unlike the previous wire tangent values.
+- Smaller 1920x1200 encoded stream did not materially improve throughput. Removed experiment, restored full resolution.
+- Motion diagnostic reported large offsets (mean ~3 deg, 57% UI >2 deg). This requires further controlled investigation;
+  the test uses image matching against an animated environment and does not by itself prove the fence cause.
+  Temporary fence tracing showed full viewport 2560x1600 with left-eye scissor at fences, not conclusive early publish.
+  Removed tracing and restored pre-trace installed EGL binary; debug.macvr.presenttrace=0. No persistent firmware changes.
+- Projection/config/protocol tests pass. Goal remains incomplete: native-rate FPS, motion alignment, sustained stability,
+  and wearer verification are not established. No commits or pushes. AgentCollab localhost refused connections.
+
+- User confirmed on 2026-10-07 that zoom, eye overlap, and vertical stretch are fixed on Quest 2. Remaining focus is FPS and motion jumps.

@@ -2,7 +2,7 @@
 import stream as st
 
 Q1 = {'device': 'Quest', 'eye_w': 1216, 'eye_h': 1344,
-      'refresh_rates': [72], 'codecs': ['hevc', 'h264']}
+      'refresh_rates': [72], 'codecs': ['hevc', 'h264'], 'features': ['fov']}
 
 prof, config = st.negotiate(Q1)
 assert (prof['eye_w'], prof['eye_h']) == (1280, 1600), prof
@@ -12,6 +12,9 @@ assert (config['eye_w'], config['eye_h']) == (1280, 1600), config
 assert config['eye_w'] * 2 == prof['eye_w'] * 2, config
 assert config['fps'] == 72 and config['codec'] == 'h264', config
 assert len(config['fov']) == 2, config
+# the flat display mesh spreads the Quest 2's eye fields of view over each half: left eye 49 left, 45 right, 48 up, 50 down
+import math
+assert all(abs(a - b) < 1e-9 for a, b in zip(config['fov'][0], [-math.radians(49), math.radians(45), math.radians(48), -math.radians(50)])), config
 
 # unknown headsets echo their HELLO size, capped at 72 fps
 prof2, config2 = st.negotiate({'device': 'X', 'eye_w': 800,
@@ -178,3 +181,12 @@ t.join(timeout=5)
 assert not t.is_alive()
 c.close(); d.close()
 print('captured pose preserved on frozen repeats')
+
+# Check the actual client projection conversion, not just the CONFIG values.
+from calibrate_display import intrinsics
+for eye in (0, 1):
+    fx, fy, cx, cy = intrinsics(eye)
+    l, r, u, d = map(math.tan, config["fov"][eye])
+    assert abs(fx * (r - l) - st.EYE_W) < 1e-6
+    assert abs(fy * (u - d) - st.CAP_H) < 1e-6
+    assert abs(cx + l * fx) < 1e-6 and abs(cy - u * fy) < 1e-6

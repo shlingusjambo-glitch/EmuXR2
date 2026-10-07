@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """EmuXR2 -> Quest streaming (the VR4Mac client, com.vr4mac.client, protocol in VR4Mac's common/vr4mac.h).
 
-Frames: Horizon's own casting capture, both eyes undistorted side by side (input/Capture.java), shown on the
-emulator's display and read from its shared framebuffer. Each frame carries the number of the head pose it was
-rendered with (stamped by the EGL shim), so its VIDEO packet names the headset's exact tracking sample and the
-headset reprojects it correctly. Head poses go straight to the guest's injector (input/Injector.java) over
+Frames: Meta's compositor's own display output, read from the emulator's shared framebuffer. Its lens-distortion mesh
+is replaced by a flat one (bridge/flat_mesh.py), so each half of the display is that eye's plain perspective view over
+exactly the Quest 2's field of view, composited and timewarped by Horizon as on a headset. Each frame carries the number
+of the head pose it was drawn with (stamped by the EGL shim), so its VIDEO packet names the headset's exact tracking
+sample and the headset reprojects it correctly. Head poses go straight to the guest's injector (input/Injector.java) over
 adb forward, one per TRACKING packet.
 
 Usage: stream.py   (emulator running, Quest on USB with the VR4Mac client; needs PyAV with VideoToolbox)
@@ -28,6 +29,7 @@ import av
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import flat_mesh
 import quest_proto as qp
 import unknown_sources
 
@@ -38,12 +40,9 @@ OUT = os.path.join(HERE, '..', 'input', 'out')
 INJECTOR_PORT, QUEST_PORT, AUDIO_PORT = 7791, 9945, 7793
 AUDIO_CHUNK = 1920   # 10 ms of 48 kHz stereo s16le (common/vr4mac.h VR4_AUDIO)
 
-# The capture: both eyes side by side, 1280x1600 each (the emulator's panel is 2560x1600). Horizon renders it with a
-# horizontal field of view of 80 degrees plus the request's "video_capture_aspect_ratio_fov"; CAPTURE_FOV_ADJ widens it
-# to the edge of Horizon's own eye images (wider shows black where the eyes rendered nothing).
+# The display: both eyes side by side, 1280x1600 each (the emulator's panel is 2560x1600).
 CAP_W, CAP_H, EYE_W = 2560, 1600, 1280
 ENC_H = CAP_H   # encoded height: 16-aligned (the Quest 1 AVC decoder drops frames otherwise)
-CAPTURE_FOV_ADJ = float(os.environ.get('EMUXR2_CAPTURE_FOV_ADJ', 9.4))
 # Horizon's raw tracking space has its floor at y = -1.675 without a Guardian (the runtime logs RawFloorHeight); the
 # Quest's stage space has it at 0. Injected heights are moved onto the guest's floor so eye height stays true.
 GUEST_FLOOR = float(os.environ.get('EMUXR2_GUEST_FLOOR', -1.675))
@@ -51,14 +50,13 @@ GUEST_FLOOR = float(os.environ.get('EMUXR2_GUEST_FLOOR', -1.675))
 # bridge/calibrate_poses.py: 60 degrees about x, 3 cm down, 4 cm back); the headset's view pose is its IMU pose. The
 # Quest's grip poses are injected as grip * GRIP_FROM_IMU^-1 so the guest's controllers land where the real ones are.
 GRIP_FROM_IMU = ((0.0, -0.03, 0.04), (math.sin(math.radians(30)), 0.0, 0.0, math.cos(math.radians(30))))
-# Measured projection (bridge/calibrate_capture.py: known head rotations, p' = K R K^-1 p) at the default 9.4 degrees:
-# square pixels, f = 662.7 px, optical centre x 674.3 / 616.6, y 776.8. Another adjustment scales the focal length with
-# the field of view and keeps the centre's offsets as tangents.
-FOCAL = 662.7 * math.tan(math.radians(89.4) / 2) / math.tan(math.radians(80 + CAPTURE_FOV_ADJ) / 2)
-CENTRE_X = tuple(EYE_W / 2 + t * FOCAL for t in (0.0518, -0.0353))
-CENTRE_Y = CAP_H / 2 - 0.035 * FOCAL
-FOV = [[math.atan(-cx / FOCAL), math.atan((EYE_W - cx) / FOCAL),
-        math.atan(CENTRE_Y / FOCAL), math.atan(-(ENC_H - CENTRE_Y) / FOCAL)] for cx in CENTRE_X]
+# Each eye's field of view (degrees left, right, up, down): the Quest 2's, which Horizon renders its eye buffers with and
+# the flat mesh spreads over each half of the display (bridge/calibrate_display.py measures it: within 0.5 %).
+EYE_FOV = ((49, 45, 48, 50), (45, 49, 48, 50))
+# CONFIG uses XrFovf angles in radians, not projection tangents. The client takes tan() when drawing.
+FOV = [[-math.radians(l), math.radians(r), math.radians(u), -math.radians(d)]
+       for l, r, u, d in EYE_FOV]
+MESH = '/data/local/tmp/emuxr2-mesh.bin'
 MARK_BLOCKS, MARK = 36, 8   # pose-number stamp: 36 blocks of 8x8 px along the bottom-left edge
 FPS, BITRATE = 60, 40_000_000
 DEFAULT_PROF = {'codec': 'h264', 'eye_w': EYE_W, 'eye_h': ENC_H,
@@ -107,8 +105,24 @@ def prepare_library():
         adb('shell', 'oculuspreferences --setc local_account_mode_enabled_v1 true')
 
 
-def start_guest(capture_only=False):
-    """(Re)start the injector and the capture in the guest; their dex files come from input/build.sh."""
+def restart_runtime():
+    """Restart Meta's VR runtime (its compositor); VrShell and ShellEnv come back with it in ~20 s."""
+    adb('shell', 'kill $(pidof com.oculus.vrruntimeservice)')
+
+
+def flat_display():
+    """Make sure the compositor draws plain eye images (the flat mesh); restarts the runtime when it had another."""
+    with open(os.path.join(OUT, 'emuxr2-mesh.bin'), 'wb') as f:
+        f.write(flat_mesh.mesh(EYE_FOV))
+    adb('push', os.path.join(OUT, 'emuxr2-mesh.bin'), MESH)
+    if adb('shell', 'getprop debug.oculus.distortionFileName').stdout.strip() != MESH:
+        adb('shell', f'chmod 644 {MESH}; setprop debug.oculus.distortionFileName {MESH}')
+        log('compositor: flat display mesh installed, restarting the VR runtime')
+        restart_runtime()
+
+
+def start_guest():
+    """(Re)start the pose injector and audio in the guest; their dex files come from input/build.sh."""
     # the guest has no proximity sensor to wake it: asleep, it composes nothing and the stream freezes
     adb('shell', 'dumpsys battery set ac 1; svc power stayon true; input keyevent WAKEUP')
     # no room to guard: Guardian only retries spatial anchors (~15/s), burning CPU and leaking memory
@@ -116,27 +130,24 @@ def start_guest(capture_only=False):
     # the brightness slider dims the stream from full: start it at full once (Horizon's default is a third)
     adb('shell', '[ "$(getprop persist.emuxr2.brightness)" = 1 ] || '
                  '{ settings put system screen_brightness_for_vr 255; setprop persist.emuxr2.brightness 1; }')
-    if not capture_only:
-        prepare_library()
-        unknown_sources.main()   # sideloaded games in the Library's Unknown Sources without a Meta account
-    for dex in ('injector', 'capture', 'audio'):
+    prepare_library()
+    unknown_sources.main()   # sideloaded games in the Library's Unknown Sources without a Meta account
+    flat_display()
+    for dex in ('injector', 'audio'):
         adb('push', f'{OUT}/{dex}.dex', f'/data/local/tmp/{dex}.dex')
-    which = 'Capture' if capture_only else '(Injector|Capture|Audio)'
-    adb('shell', f'for p in $(pgrep -f "[a]pp_process.*{which}"); do kill $p; done')
+    # the casting capture earlier versions streamed: it only costs the compositor a second render now
+    adb('shell', 'for p in $(pgrep -f "[a]pp_process.*(Injector|Capture|Audio)"); do kill $p; done')
     time.sleep(0.5)
-    if not capture_only:
-        adb('shell', 'rm -f /data/local/tmp/injector.log')
-        # Only one head-pose producer may own TrackingDataInjection.
-        adb('shell', 'setprop ctl.stop macvr-pose')
-        adb('shell', 'CLASSPATH=/data/local/tmp/injector.dex setsid nohup app_process /system/bin Injector '
-                     '> /data/local/tmp/injector.log 2>&1 < /dev/null &')
-        adb('shell', 'CLASSPATH=/data/local/tmp/audio.dex setsid nohup app_process / Audio '
-                     '> /data/local/tmp/audio.log 2>&1 < /dev/null &')
-        adb('forward', f'tcp:{AUDIO_PORT}', f'tcp:{AUDIO_PORT}')
-    adb('shell', f'CLASSPATH=/data/local/tmp/capture.dex setsid nohup app_process / Capture {CAP_W} {CAP_H} '
-                 f'{CAP_W} {CAP_H} {CAPTURE_FOV_ADJ} > /data/local/tmp/capture.log 2>&1 < /dev/null &')
+    adb('shell', 'rm -f /data/local/tmp/injector.log')
+    # Only one head-pose producer may own TrackingDataInjection.
+    adb('shell', 'setprop ctl.stop macvr-pose')
+    adb('shell', 'CLASSPATH=/data/local/tmp/injector.dex setsid nohup app_process /system/bin Injector '
+                 '> /data/local/tmp/injector.log 2>&1 < /dev/null &')
+    adb('shell', 'CLASSPATH=/data/local/tmp/audio.dex setsid nohup app_process / Audio '
+                 '> /data/local/tmp/audio.log 2>&1 < /dev/null &')
+    adb('forward', f'tcp:{AUDIO_PORT}', f'tcp:{AUDIO_PORT}')
     adb('forward', f'tcp:{INJECTOR_PORT}', f'tcp:{INJECTOR_PORT}')
-    if not capture_only and not wait_injector():
+    if not wait_injector():
         log('warning: guest pose injector not listening yet; poses will reconnect on first send')
 
 
@@ -360,18 +371,9 @@ def brightness_gain():
         return 1.0
 
 
-def recover_guest(restart_runtime):
-    """Restart the guest capture, first the whole VR runtime when its compositor hung or it ignores capture requests."""
-    if restart_runtime:
-        adb('shell', 'kill $(pidof com.oculus.vrruntimeservice)')
-        time.sleep(20)   # the runtime, VrShell and ShellEnv come back
-    start_guest(capture_only=True)
-
-
 class Session:
     def __init__(self, client, display, guest):
         self.client, self.display, self.guest = client, display, guest
-        self.recovery = None
         self.audio_thread = None
         self.gain = 1.0
         self.lock = threading.Lock()
@@ -547,7 +549,6 @@ class Session:
         last_pixels = None   # last encoded frame, re-sent while the display is frozen
         idle_interval = 1.0 / max(1, min(72, int(os.environ.get('EMUXR2_IDLE_FPS', '1'))))
         stamped_at = time.monotonic()
-        capture_restarts = streak = 0
         while not self.stop:
             try:
                 hello = self.hellos.get_nowait()
@@ -560,21 +561,12 @@ class Session:
                 time.sleep(min(.001, 1.0 / self.prof['fps'] - (now - sent_at)))
                 continue
             last, img = self.display.grab(last)
-            # No stamped frames for 5 s: the capture ended, or the compositor hung acquiring a window buffer (the
-            # display then freezes). Ask for the capture again; if that doesn't bring frames back, restart the runtime
-            # (after a swap error it ignores capture requests, and only a restart clears a hung compositor).
-            # Recovery runs beside this loop, so the keepalive frames keep the headset connected meanwhile.
-            if now - stamped_at > 5 and not (self.recovery and self.recovery.is_alive()):
-                capture_restarts += 1
-                restart_runtime = capture_restarts >= 2
-                if restart_runtime:
-                    log('capture still dead: restarting the guest VR runtime')
-                    capture_restarts = 0
-                else:
-                    log('no stamped capture frames for 5 s: restarting guest capture')
-                self.recovery = threading.Thread(target=recover_guest, args=(restart_runtime,), daemon=True)
-                self.recovery.start()
-                stamped_at = now + (25 if restart_runtime else 0)
+            # No stamped frames for 10 s: the compositor hung (acquiring a window buffer, say; the display then
+            # freezes) or died. Restart the runtime; keepalive frames hold the headset connected meanwhile.
+            if now - stamped_at > 10:
+                log('no stamped frames for 10 s: restarting the guest VR runtime')
+                restart_runtime()
+                stamped_at = now + 30
             if img is None:
                 # frozen display (idle scene): keep a frame a second flowing, or the
                 # client times out and flaps through HELLO/CONFIG re-handshakes.
@@ -599,10 +591,7 @@ class Session:
                     continue
                 seq = pose_number(img)
                 if seq is not None:
-                    streak = streak + 1 if now - stamped_at < 0.5 else 0
                     stamped_at = now
-                    if streak >= 30:   # a working capture, not stray frames from a dying one
-                        capture_restarts = 0
                 when = self.times.get(seq)
                 sig = img[::16, ::16]   # the emulator display repeats frames: skip ones identical to the last sent
                 why = 'unstamped' if seq is None else 'unknown pose' if when is None else \

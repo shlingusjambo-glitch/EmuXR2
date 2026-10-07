@@ -63,7 +63,7 @@ def main():
     with socket.create_connection(('127.0.0.1', 9945), timeout=10) as s:
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         hello = json.dumps(dict(device='live smoke', eye_w=args.eye_w, eye_h=args.eye_h,
-                                refresh_rates=[72], codecs=['h264'])).encode()
+                                refresh_rates=[72], codecs=['h264'], features=['fov'])).encode()
         framed = struct.pack('<BI', 1, len(hello)) + hello
         for chunk in (framed[:2], framed[2:8], framed[8:]):
             s.sendall(chunk)

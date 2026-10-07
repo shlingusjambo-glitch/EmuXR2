@@ -12,7 +12,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import stream as st
-import calibrate_capture as cc
+import calibrate_display as cc
 
 
 def main():
@@ -47,12 +47,12 @@ def main():
             frames.append((time.monotonic(), img))
         time.sleep(.002)
     state['stop'] = True
-    W, H, f = st.EYE_W, st.CAP_H, st.FOCAL
-    cx, cy = st.CENTRE_X[0], st.CENTRE_Y
+    W, H = st.EYE_W, st.CAP_H
+    f, fy, cx, cy = cc.intrinsics(0)
     a = cc.grey(ref[:, :W])
     ui = (a < 90)   # Horizon's panels are dark; the environment is bright
     v, u = np.mgrid[0:H - 16:4, 0:W:4]
-    rays = np.stack([u - cx, -(v - cy), -np.full(u.shape, f)], -1)
+    rays = np.stack([(u - cx) / f, -(v - cy) / fy, -np.ones(u.shape)], -1)
     rows = []
     for when, img in frames:
         seq = st.pose_number(img)
@@ -62,7 +62,7 @@ def main():
         R = cc.matrix(cc.axis((0, 1, 0), yaw)).T   # reference rays into the frame's camera
         d = rays @ R.T
         u1 = cx + f * d[..., 0] / -d[..., 2]
-        v1 = cy - f * d[..., 1] / -d[..., 2]
+        v1 = cy - fy * d[..., 1] / -d[..., 2]
         b = cc.grey(img[:, :W])
         out = {}
         for name, mask in (('ui', ui[v, u]), ('world', ~ui[v, u])):
