@@ -311,16 +311,19 @@ def hide_stamp(frame):
 
 
 CLIENT = 'com.vr4mac.client'
+# fov: frames shown at their own field of view (else the world looks magnified); parallax: frames re-aimed for eye
+# movement as well as rotation (else the world wobbles as the head turns)
+CLIENT_FEATURES = {'fov', 'parallax'}
 CLIENT_APK = os.environ.get('EMUXR2_CLIENT_APK', os.path.join(HERE, '..', '..', 'android', 'app', 'build', 'outputs',
                                                               'apk', 'debug', 'app-debug.apk'))
 
 
 def update_client():
-    """Replace an outdated headset client (one that can't show frames at their own field of view, so the world looks
-    magnified) with the one built from this repository, over USB, and start it."""
+    """Replace an outdated headset client (one without CLIENT_FEATURES) with the one built from this repository, over USB,
+    and start it."""
     quest = quest_serial()
     if not quest or not os.path.exists(CLIENT_APK):
-        log('headset client is outdated (no field-of-view support: the view looks zoomed in); install', CLIENT_APK)
+        log('headset client is outdated (missing', ', '.join(CLIENT_FEATURES) + '); install', CLIENT_APK)
         return
     log(f'headset client is outdated: installing {CLIENT_APK} on {quest}')
     r = adb('install', '-r', '-g', CLIENT_APK, serial=quest, timeout=120)
@@ -568,7 +571,7 @@ class Session:
         self.need_idr = True
         self.send(2, json.dumps(config).encode())
         log('CONFIG:', json.dumps(config))
-        if 'fov' not in hello.get('features', ()) and not getattr(Session, 'updating', None):
+        if not CLIENT_FEATURES <= set(hello.get('features', ())) and not getattr(Session, 'updating', None):
             Session.updating = threading.Thread(target=update_client, daemon=True)   # once per streamer run
             Session.updating.start()
         if hello.get('audio') and not (self.audio_thread and self.audio_thread.is_alive()):
