@@ -90,16 +90,35 @@ static void *commands(void *u) {
     return NULL;
 }
 
-// The pose-number stamp the compositor writes along the bottom-left edge (green bits 1011, then a 32-bit pose
-// number) and a frame signature, read on the raw portrait frame (rw x rh = h x w of the upright one): upright
-// (r, c) is raw (c', r) with c' = rh - 1 - c, so skipped frames are never rotated.
-static int64_t readStampRaw(const uint8_t *raw, int rw, int rh) {
-    int bits[MARK_BLOCKS], r = rw - MARK / 2;
-    for (int i = 0; i < MARK_BLOCKS; i++) bits[i] = raw[((size_t)(rh - 1 - (MARK / 2 + i * MARK)) * rw + r) * 4 + 1] > 127;
+// The pose-number stamp the compositor writes along the bottom-left edge of the upright (W x H, landscape) picture:
+// green bits 1011, then a 32-bit pose number. The emulator hands over its display turned however its window is
+// turned, so the raw frame is the upright picture rotated by one of four orientations, named by what turns it upright:
+// 0 clockwise 90 (the portrait display as the guest draws it), 1 none, 2 counter-clockwise 90, 3 180. Upright (y, x)
+// is read straight from the raw frame, so skipped frames are never rotated.
+static size_t rawIndex(int o, int W, int H, int y, int x) {
+    switch (o) {
+    case 0: return (size_t)(W - 1 - x) * H + y;
+    case 1: return (size_t)y * W + x;
+    case 2: return (size_t)x * H + (H - 1 - y);
+    default: return (size_t)(H - 1 - y) * W + (W - 1 - x);
+    }
+}
+static int64_t readStamp(const uint8_t *raw, int o, int W, int H) {
+    int bits[MARK_BLOCKS];
+    for (int i = 0; i < MARK_BLOCKS; i++) bits[i] = raw[rawIndex(o, W, H, H - MARK / 2, MARK / 2 + i * MARK) * 4 + 1] > 127;
     if (!(bits[0] && !bits[1] && bits[2] && bits[3])) return -1;
     int64_t v = 0;
     for (int i = 4; i < MARK_BLOCKS; i++) v |= (int64_t)bits[i] << (i - 4);
     return v;
+}
+
+// the stamp and the orientation it was found in (the last one first; -1 and the last one when there's none)
+static int64_t findStamp(const uint8_t *raw, int W, int H, int *o) {
+    for (int k = 0; k < 4; k++) {
+        int c = (*o + k) % 4; int64_t v = readStamp(raw, c, W, H);
+        if (v >= 0) { *o = c; return v; }
+    }
+    return -1;
 }
 
 static uint64_t signature(const uint8_t *rgba, int w, int h) {   // FNV-1a over every 16th pixel
@@ -162,7 +181,6 @@ int main(int argc, char **argv) {
         CVPixelBufferPoolCreate(0, NULL, CFDictionaryCreate(0, pk, kv2, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks), &landscapePool);
         if (VTPixelRotationSessionCreate(0, &rot) || VTPixelTransferSessionCreate(0, &xfer)) cpu = 1;
         else {
-            VTSessionSetProperty(rot, kVTPixelRotationPropertyKey_Rotation, kVTRotation_CW90);
             VTSessionSetProperty(xfer, kVTPixelTransferPropertyKey_DestinationYCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_601_4);
         }
         if (cpu) fprintf(stderr, "vtenc: no hardware rotation/transfer; converting with vImage\n");
@@ -171,7 +189,9 @@ int main(int argc, char **argv) {
 
     inflight = dispatch_semaphore_create(2);
     pthread_t cmd; pthread_create(&cmd, NULL, commands, NULL);
-    uint64_t last = *seq, lastSig = 0; int64_t lastStamp = -2, seenStamp = -1;
+    uint64_t last = *seq, lastSig = 0; int64_t lastStamp = -2, seenStamp = -1; int orient = 0, rotSet = -1;
+    CFStringRef vtRot[4] = {kVTRotation_CW90, kVTRotation_0, kVTRotation_CCW90, kVTRotation_180};
+    const uint8_t viRot[4] = {kRotate90DegreesClockwise, kRotate0DegreesClockwise, kRotate90DegreesCounterClockwise, kRotate180DegreesClockwise};
     double lastEncode = 0, lastStat = now(); uint32_t seen = 0; float lastGain = -1;
     uint8_t lutY[256], lutC[256];
     while (!atomic_load(&quitting)) {
@@ -184,8 +204,9 @@ int main(int argc, char **argv) {
         uint64_t cur = *seq;
         if (cur == last) { usleep(500); continue; }
         last = cur;
-        vImage_Buffer src = {(void *)raw, (vImagePixelCount)W, (vImagePixelCount)H, (size_t)H * 4};   // portrait
-        int64_t stamp = readStampRaw(raw, H, W);
+        int64_t stamp = findStamp(raw, W, H, &orient);
+        int side = orient % 2 == 0;   // the raw frame is portrait-shaped (H wide, W tall)
+        vImage_Buffer src = {(void *)raw, (vImagePixelCount)(side ? W : H), (vImagePixelCount)(side ? H : W), (size_t)(side ? H : W) * 4};
         uint64_t sig = signature(raw, H, W);
         if (*seq != cur) continue;   // written while reading: take the next one
         seen++;
@@ -194,23 +215,26 @@ int main(int argc, char **argv) {
         if (wait && t - lastEncode < 1) continue;   // repeats, unstamped or untracked frames: one a second
         CVPixelBufferRef pb;
         if (!cpu) {
-            CVPixelBufferRef portrait, landscape;
-            if (CVPixelBufferPoolCreatePixelBuffer(0, portraitPool, &portrait)) continue;
-            CVPixelBufferLockBaseAddress(portrait, 0);
-            uint8_t *pp = CVPixelBufferGetBaseAddress(portrait); size_t prb = CVPixelBufferGetBytesPerRow(portrait);
-            vImage_Buffer pdst = {pp, (vImagePixelCount)W, (vImagePixelCount)H, prb};
+            CVPixelBufferRef raw2, landscape;
+            if (CVPixelBufferPoolCreatePixelBuffer(0, side ? portraitPool : landscapePool, &raw2)) continue;
+            CVPixelBufferLockBaseAddress(raw2, 0);
+            vImage_Buffer pdst = {CVPixelBufferGetBaseAddress(raw2), src.height, src.width, CVPixelBufferGetBytesPerRow(raw2)};
             vImagePermuteChannels_ARGB8888(&src, &pdst, rgbaToBgra, TILE);
-            // cover the stamp with the row above it (black there shows when the headset stretches the edge); in
-            // portrait coordinates that row is column H - MARK - 1, over the stamp's columns H - MARK .. H - 1
-            for (int c = 0; c < MARK_BLOCKS * MARK; c++) {
-                uint32_t *row = (uint32_t *)(pp + (size_t)(W - 1 - c) * prb);
-                for (int r = H - MARK; r < H; r++) row[r] = row[H - MARK - 1];
+            CVPixelBufferUnlockBaseAddress(raw2, 0);
+            if (*seq != cur) { CVPixelBufferRelease(raw2); continue; }
+            OSStatus e1 = 0;
+            if (orient == 1) landscape = raw2;   // already upright
+            else {
+                if (CVPixelBufferPoolCreatePixelBuffer(0, landscapePool, &landscape)) { CVPixelBufferRelease(raw2); continue; }
+                if (rotSet != orient) { VTSessionSetProperty(rot, kVTPixelRotationPropertyKey_Rotation, vtRot[orient]); rotSet = orient; }
+                e1 = VTPixelRotationSessionRotateImage(rot, raw2, landscape);
+                CVPixelBufferRelease(raw2);
             }
-            CVPixelBufferUnlockBaseAddress(portrait, 0);
-            if (*seq != cur) { CVPixelBufferRelease(portrait); continue; }
-            if (CVPixelBufferPoolCreatePixelBuffer(0, landscapePool, &landscape)) { CVPixelBufferRelease(portrait); continue; }
-            OSStatus e1 = VTPixelRotationSessionRotateImage(rot, portrait, landscape);
-            CVPixelBufferRelease(portrait);
+            // cover the stamp with the row above it (black there shows when the headset stretches the edge)
+            CVPixelBufferLockBaseAddress(landscape, 0);
+            uint8_t *lp = CVPixelBufferGetBaseAddress(landscape); size_t lrb = CVPixelBufferGetBytesPerRow(landscape);
+            for (int y = H - MARK; y < H; y++) memcpy(lp + (size_t)y * lrb, lp + (size_t)(H - MARK - 1) * lrb, MARK_BLOCKS * MARK * 4);
+            CVPixelBufferUnlockBaseAddress(landscape, 0);
             if (e1 || CVPixelBufferPoolCreatePixelBuffer(0, pool, &pb)) { CVPixelBufferRelease(landscape); fprintf(stderr, "vtenc: rotate %d\n", (int)e1); continue; }
             OSStatus e2 = VTPixelTransferSessionTransferImage(xfer, landscape, pb);
             CVPixelBufferRelease(landscape);
@@ -221,7 +245,7 @@ int main(int argc, char **argv) {
         {
         vImage_Buffer dst = {upright, (vImagePixelCount)H, (vImagePixelCount)W, (size_t)W * 4};
         uint8_t black[4] = {0};
-        vImageRotate90_ARGB8888(&src, &dst, kRotate90DegreesClockwise, black, TILE);
+        vImageRotate90_ARGB8888(&src, &dst, viRot[orient], black, TILE);
         // cover the stamp with the row above it (black there shows when the headset stretches the edge)
         for (int y = H - MARK; y < H; y++) memcpy(upright + (size_t)y * W * 4, upright + (size_t)(H - MARK - 1) * W * 4, MARK_BLOCKS * MARK * 4);
         if (CVPixelBufferPoolCreatePixelBuffer(0, pool, &pb)) continue;
