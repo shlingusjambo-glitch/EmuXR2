@@ -93,6 +93,15 @@ Streaming negotiates up to 72 fps from the headset's reported refresh rate;
 and decoder delivery rates must be measured separately. A static frozen display
 retains its captured pose timestamp, even on keep-alive repeats.
 
+The macOS capture path uses Accelerate to rotate the portrait framebuffer without
+changing its pixel bytes, then reuses the video converter and avoids extra full-frame
+copies. Other hosts use the NumPy rotation fallback. `EMUXR2_PROFILE=1 ./start-streamer.sh`
+reports conversion/encoding/send times and head/eye pose agreement. The compositor's
+window buffer need not be preserved because its persistent front texture is copied
+in full at each presentation; `debug.macvr.preserve_window=1` restores preservation
+for comparison. Native presentation timing is available with `debug.macvr.profile=1`
+after restarting the runtime.
+
 When no guest account exists, the streamer selects Horizon's native local-account
 mode so Library can finish loading offline. `EMUXR2_LOCAL_ACCOUNT=0` opts out;
 `adb -s emulator-5554 shell oculuspreferences --setc local_account_mode_enabled_v1 false`

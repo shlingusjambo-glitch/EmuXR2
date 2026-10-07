@@ -26,6 +26,7 @@ import time
 from fractions import Fraction
 
 import av
+import pixels
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -175,16 +176,18 @@ class Display:
         n = self.counter()
         if n == last:
             return last, None
-        raw = self.px.copy()
+        img = self.snapshot()
         if self.counter() != n:   # written while copying: take the next one
             return last, None
-        up = raw if self.w > self.h else np.rot90(raw, -1)   # the panel scans out portrait
-        return n, np.ascontiguousarray(up)
+        return n, img
+
+    def snapshot(self):
+        """Own one upright snapshot; rotating the shared view before copying avoids a second full-frame copy."""
+        return pixels.snapshot(self.px)
 
     def current(self):
         """The current upright image regardless of the frame counter, or None."""
-        up = self.px.copy() if self.w > self.h else np.rot90(self.px.copy(), -1)
-        img = np.ascontiguousarray(up)
+        img = self.snapshot()
         return img if img.shape == (CAP_H, CAP_W) else None
 
 
@@ -386,8 +389,15 @@ class Session:
         self.origin = None       # first head position: the guest's floor origin is put under it
         self.menu = [0, 0]       # left menu button: held since, Back pulse until
         self.encoder = None
+        self.reformatter = av.video.reformatter.VideoReformatter()
+        self.encoder_times = {}
+        self.encoder_pts = 0
         self.status_at = 0
         self.hellos = queue.Queue()
+        self.profile = os.environ.get('EMUXR2_PROFILE') == '1'
+        self.profile_samples = []
+        self.pose_profile = []
+        self.pose_profile_at = 0
 
     def send(self, ptype, payload):
         with self.lock:
@@ -409,13 +419,12 @@ class Session:
         except ValueError as e:
             log('bad HELLO:', e)
             return
-        # x264 zerolatency: its stream tells the decoder not to hold frames back (VideoToolbox's doesn't, and the
-        # Quest's decoder then sits on ~5 frames). Rate-capped so a busy frame can't stall the link.
         if self.encoder is not None:
             try:
                 self.encoder.close()
             except Exception:
                 pass
+        # Software zerolatency encoding is faster here than low-delay VideoToolbox and avoids decoder buffering.
         c = av.CodecContext.create('libx264', 'w')
         c.width, c.height, c.pix_fmt = prof['eye_w'] * 2, prof['eye_h'], 'yuv420p'
         c.time_base, c.framerate = Fraction(1, 1_000_000), Fraction(prof['fps'], 1)
@@ -424,6 +433,7 @@ class Session:
         c.options = {'preset': 'ultrafast', 'tune': 'zerolatency',
                      'x264-params': f'vbv-maxrate={kbps}:vbv-bufsize={kbps // prof["fps"] * 2}:repeat-headers=1'}
         c.open()
+        self.encoder_times.clear()
         self.encoder = c
         self.prof = prof
         self.need_idr = True
@@ -441,6 +451,19 @@ class Session:
         px, py, pz, qx, qy, qz, qw = t['head']
         if (qx, qy, qz, qw) == (0, 0, 0, 1) and t['time_ns'] == 0:
             return
+        if self.profile:
+            head_q = np.asarray((qx, qy, qz, qw))
+            for offset in (36, 80):
+                eye_q = np.asarray(struct.unpack_from('<7f', payload, offset)[3:])
+                norm = np.linalg.norm(head_q) * np.linalg.norm(eye_q)
+                if norm > 0:
+                    self.pose_profile.append(math.degrees(2 * math.acos(min(1, abs(float(head_q @ eye_q)) / norm))))
+            now = time.monotonic()
+            if now - self.pose_profile_at >= 5 and self.pose_profile:
+                log('head/eye orientation disagreement degrees median/max:',
+                    round(float(np.median(self.pose_profile)), 3), round(max(self.pose_profile), 3))
+                self.pose_profile.clear()
+                self.pose_profile_at = now
         if self.origin is None:
             self.origin = (px, pz)
             log('headset eye fields of view (left right up down, degrees):',
@@ -482,25 +505,44 @@ class Session:
 
     def emit(self, pixels, when):
         """Encode one full-res padded frame and send it as VIDEO."""
+        begin = time.monotonic() if self.profile else 0
         fw, fh = self.prof['eye_w'] * 2, self.prof['eye_h']
-        frame = av.VideoFrame.from_ndarray(pixels.view(np.uint8).reshape(ENC_H, CAP_W, 4), format='bgra')
+        frame = av.VideoFrame.from_numpy_buffer(pixels.view(np.uint8).reshape(ENC_H, CAP_W, 4), format='bgra')
         if (fw, fh) == (CAP_W, ENC_H):
-            frame = frame.reformat(format='yuv420p')
+            frame = self.reformatter.reformat(frame, format=self.encoder.pix_fmt)
         else:
-            frame = frame.reformat(width=fw, height=fh, format='yuv420p')
+            frame = self.reformatter.reformat(frame, width=fw, height=fh, format=self.encoder.pix_fmt)
         if self.gain < 0.995:   # Horizon's brightness slider: luma scaled, chroma pulled toward neutral
             luma, chroma = dim_tables(self.gain)
             for i, lut in enumerate((luma, chroma, chroma)):
                 plane = np.frombuffer(frame.planes[i], np.uint8)
                 np.take(lut, plane, out=plane)
-        frame.pts = int(time.monotonic() * 1_000_000)
+        self.encoder_pts = max(self.encoder_pts + 1, int(time.monotonic() * 1_000_000))
+        frame.pts = self.encoder_pts
+        self.encoder_times[frame.pts] = when
+        if len(self.encoder_times) > 512:
+            raise ConnectionError('encoder frame queue exceeded bounded pose history')
         if self.need_idr:
             self.need_idr = False
             frame.pict_type = av.video.frame.PictureType.I
-        for pkt in self.encoder.encode(frame):
-            header = struct.pack('<QQB', self.frame_id, when, 1 if pkt.is_keyframe else 0)
+        converted = time.monotonic() if self.profile else 0
+        packets = self.encoder.encode(frame)
+        encoded = time.monotonic() if self.profile else 0
+        for pkt in packets:
+            captured_when = self.encoder_times.pop(pkt.pts, None)
+            if captured_when is None:
+                raise ConnectionError('encoded packet has no matching captured pose')
+            header = struct.pack('<QQB', self.frame_id, captured_when, 1 if pkt.is_keyframe else 0)
             self.send(4, header + bytes(pkt))
             self.frame_id += 1
+        if self.profile:
+            sent = time.monotonic()
+            self.profile_samples.append(((converted - begin) * 1000, (encoded - converted) * 1000, (sent - encoded) * 1000))
+            if len(self.profile_samples) >= 120:
+                samples = np.asarray(self.profile_samples)
+                log('host frame ms (convert encode send), median/p95:',
+                    np.round(np.median(samples, axis=0), 2).tolist(), np.round(np.percentile(samples, 95, axis=0), 2).tolist())
+                self.profile_samples.clear()
 
     def audio(self):
         """The guest's sound to the headset: 10 ms PCM chunks from input/Audio.java, as VR4_AUDIO packets."""
@@ -544,7 +586,6 @@ class Session:
 
     def _run(self):
         last, sent_seq, sent_sig, sent_at, n, t0, skipped = None, None, None, 0.0, 0, time.monotonic(), {}
-        padded = np.zeros((ENC_H, CAP_W), np.uint32)
         last_when = 0
         last_pixels = None   # last encoded frame, re-sent while the display is frozen
         idle_interval = 1.0 / max(1, min(72, int(os.environ.get('EMUXR2_IDLE_FPS', '1'))))
@@ -578,9 +619,8 @@ class Session:
                         if cur is None:
                             time.sleep(0.001)
                             continue
-                        padded[:CAP_H] = cur
-                        hide_stamp(padded)
-                        last_pixels = padded.copy()
+                        hide_stamp(cur)
+                        last_pixels = cur
                     self.emit(last_pixels, last_when)
                     sent_at, behind, n = now, 0, n + 1
                 else:
@@ -606,10 +646,9 @@ class Session:
                 if why:
                     skipped[why] = skipped.get(why, 0) + 1
                     continue
-                padded[:CAP_H] = img
-                hide_stamp(padded)
-                self.emit(padded, when)
-                last_pixels = padded.copy()
+                hide_stamp(img)
+                self.emit(img, when)
+                last_pixels = img
                 last_when = when
                 sent_seq, sent_sig, sent_at = seq, sig.copy(), now
                 behind, n = (self.seq - seq if when else 0), n + 1

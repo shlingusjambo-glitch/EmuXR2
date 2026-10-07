@@ -190,3 +190,70 @@ for eye in (0, 1):
     assert abs(fx * (r - l) - st.EYE_W) < 1e-6
     assert abs(fy * (u - d) - st.CAP_H) < 1e-6
     assert abs(cx + l * fx) < 1e-6 and abs(cy - u * fy) < 1e-6
+
+# Shared framebuffer snapshots own their pixels, keep the correct eye orientation, and reject counter races.
+for w, h in ((6, 4), (4, 6)):
+    display = object.__new__(st.Display)
+    display.w, display.h = w, h
+    display.px = _np.arange(w * h, dtype=_np.uint32).reshape(h, w)
+    expected = display.px.copy() if w > h else _np.rot90(display.px, -1).copy()
+    display.counter = lambda: 7
+    n, captured = display.grab(6)
+    assert n == 7 and captured.flags.c_contiguous and captured.flags.owndata
+    display.px[:] = 0
+    assert _np.array_equal(captured, expected)
+    counters = iter((8, 9))
+    display.counter = lambda: next(counters)
+    assert display.grab(7) == (7, None)
+
+# An encoder that returns a prior frame must retain that frame's pose, never the current input pose.
+import av as _av
+class _DelayedEncoder:
+    pix_fmt = 'yuv420p'
+    previous = None
+    def encode(self, frame):
+        old, self.previous = self.previous, frame.pts
+        if old is None:
+            return []
+        packet = _av.Packet(b'delayed-frame')
+        packet.pts = old
+        return [packet]
+left, right = _socket.socketpair()
+try:
+    delayed = st.Session(left, None, None)
+    delayed.prof = dict(st.DEFAULT_PROF)
+    delayed.encoder = _DelayedEncoder()
+    delayed.emit(px, 100)
+    delayed.emit(px, 200)
+    kind, payload = _recv_pkt(right)
+    assert kind == 4 and _struct.unpack('<QQB', payload[:17])[1] == 100
+finally:
+    left.close(); right.close()
+
+# Decode a real encoded stereo frame immediately; wrapping numpy buffers must keep eye order and colors.
+left, right = _socket.socketpair()
+for sock in (left, right):
+    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_SNDBUF, 8 << 20)
+    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_RCVBUF, 8 << 20)
+try:
+    colored = st.Session(left, None, None)
+    colored.configure(Q1)
+    assert _recv_pkt(right)[0] == 2
+    pixels = _np.empty((st.CAP_H, st.CAP_W), _np.uint32)
+    pixels[:, :st.EYE_W] = 0xffff0000
+    pixels[:, st.EYE_W:] = 0xff00ff00
+    colored.emit(pixels, 555)
+    kind, payload = _recv_pkt(right)
+    decoder = _av.CodecContext.create('h264', 'r')
+    decoder.thread_count = 1
+    frames = decoder.decode(_av.Packet(payload[17:]))
+    assert kind == 4 and len(frames) == 1, 'encoder/bitstream introduced frame buffering'
+    rgb = frames[0].to_ndarray(format='rgb24')
+    assert tuple(rgb.shape[:2]) == (st.CAP_H, st.CAP_W)
+    assert rgb[st.CAP_H // 2, st.EYE_W - 8, 0] > 240
+    assert rgb[st.CAP_H // 2, st.EYE_W - 8, 1] < 10
+    assert rgb[st.CAP_H // 2, st.EYE_W + 8, 1] > 240
+    assert rgb[st.CAP_H // 2, st.EYE_W + 8, 0] < 10
+finally:
+    left.close(); right.close()
+print('encoder timing, immediate decode, stereo colors and snapshot ownership verified')

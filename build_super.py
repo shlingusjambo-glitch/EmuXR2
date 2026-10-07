@@ -4,6 +4,24 @@ import hashlib, os, shutil, struct, subprocess, sys
 from lpdump import read_super
 SECT, BASE = 512, 4096 * 512   # super partition starts at GPT sector 4096 in emulator images
 
+def sparsify(f):
+    """Deallocate only complete zero ranges in our generated APFS disk, preserving all logical bytes."""
+    if sys.platform != 'darwin': return
+    import fcntl
+    position = f.tell()
+    block = 1 << 20
+    zeros = bytes(block)
+    f.flush(); f.seek(0)
+    offset = 0
+    try:
+        while data := f.read(block):
+            if data == zeros:
+                # Darwin F_PUNCHHOLE, fpunchhole_t: flags, reserved, offset, length.
+                fcntl.fcntl(f.fileno(), 99, struct.pack('IIqq', 0, 0, offset, block))
+            offset += len(data)
+    finally:
+        f.seek(position)
+
 def main(src, out, repl):
     subprocess.run(['cp', '-c', src, out], check=True)   # APFS clone: only rewritten blocks take space
     f = open(out, 'r+b'); m = read_super(f, BASE)
@@ -34,6 +52,7 @@ def main(src, out, repl):
     hdr[12:44] = b'\0' * 32; hdr[12:44] = hashlib.sha256(hdr).digest()
     for s in range(m['slots'] * 2):   # primary slots then backups
         f.seek(BASE + 4096 * 3 + s * m['mmax']); f.write(hdr); f.write(tab)
+    sparsify(f)
     f.close()
     for name, n, start in exts: print(f'{name}: {n * SECT >> 20} MB at sector {start}')
 

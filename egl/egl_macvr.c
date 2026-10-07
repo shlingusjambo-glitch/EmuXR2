@@ -89,6 +89,10 @@ static int isCompositor(void) {
 static void stamp(void);
 static int frontToWindow(void);
 static void frontRebind(void);
+static int64_t monotonicNs(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000000000LL + t.tv_nsec;
+}
 static void present(void) {
     if (!isCompositor()) return;
     EGLSurface s = eglGetCurrentSurface(EGL_DRAW); int front = 0;
@@ -100,10 +104,26 @@ static void present(void) {
     // never wait on SurfaceFlinger: it in turn waits on virtual-display buffers this compositor releases
     static __thread EGLSurface async;
     if (async != s) { ((EGLBoolean (*)(EGLDisplay, EGLint))real("eglSwapInterval"))(eglGetCurrentDisplay(), 0); async = s; LOG("compositor surface %p: swap interval 0", s); }
+    static __thread int profile = -1;
+    if (profile < 0) { char v[PROP_VALUE_MAX] = {0}; __system_property_get("debug.macvr.profile", v); profile = atoi(v); }
+    int64_t a = profile ? monotonicNs() : 0;
     if (!frontToWindow()) return;
+    int64_t b = profile ? monotonicNs() : 0;
     stamp();
+    int64_t c = profile ? monotonicNs() : 0;
     ((EGLBoolean (*)(EGLDisplay, EGLSurface))real("eglSwapBuffers"))(eglGetCurrentDisplay(), s);
+    int64_t e = profile ? monotonicNs() : 0;
     frontRebind();
+    if (profile) {
+        static __thread int n; static __thread int64_t start, blit, marker, swap;
+        if (!start) start = a;
+        n++; blit += b - a; marker += c - b; swap += e - c;
+        if (e - start >= 1000000000LL) {
+            LOG("presentation %.1f fps: blit %.2f ms stamp %.2f ms swap %.2f ms", n * 1e9 / (e - start),
+                blit / (n * 1e6), marker / (n * 1e6), swap / (n * 1e6));
+            start = e; n = 0; blit = marker = swap = 0;
+        }
+    }
 }
 static void frontBuffer(EGLSurface s) {
     for (int i = 0; i < 32; i++) if (wins[i].s == s) {
@@ -121,10 +141,13 @@ EGLSurface eglCreateWindowSurface(EGLDisplay d, EGLConfig c, EGLNativeWindowType
     if (s != EGL_NO_SURFACE && isCompositor()) {
         hookRuntime();
         // Meta's compositor swaps once, then keeps drawing into that buffer, which the Quest's display scans out.
-        // Here the surface keeps its contents across swaps, and is presented at the compositor's fences (see present).
-        EGLBoolean ok = ((EGLBoolean (*)(EGLDisplay, EGLSurface, EGLint, EGLint))real("eglSurfaceAttrib"))(d, s, EGL_SWAP_BEHAVIOR, EGL_BUFFER_PRESERVED);
+        // Our persistent front texture keeps those contents. Each fence copies it in full to the window,
+        // so preserving the window's old back buffer is redundant. Keep an override for comparison.
+        char preserve[PROP_VALUE_MAX] = {0}; __system_property_get("debug.macvr.preserve_window", preserve);
+        EGLint behavior = preserve[0] == '1' ? EGL_BUFFER_PRESERVED : EGL_BUFFER_DESTROYED;
+        EGLBoolean ok = ((EGLBoolean (*)(EGLDisplay, EGLSurface, EGLint, EGLint))real("eglSurfaceAttrib"))(d, s, EGL_SWAP_BEHAVIOR, behavior);
         for (int i = 0; i < 32; i++) if (wins[i].s == s) wins[i].front = 1;
-        LOG("compositor surface %p: preserved %d", s, ok);
+        LOG("compositor surface %p: swap behavior 0x%x, accepted %d", s, behavior, ok);
     }
     return s;
 }
