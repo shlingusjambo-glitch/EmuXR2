@@ -390,6 +390,7 @@ class Session:
         self.frame_id = 0
         self.seq = int(time.time() * 1000) & 0x3FFFFFFF   # fresh numbers each run: the guest still shows the last ones
         self.times = {}          # pose number -> the headset's tracking time
+        self.pose_at = 0.0       # when the headset last sent a pose (an idle headset sends none; the guest then draws nothing)
         self.origin = None       # first head position: the guest's floor origin is put under it
         self.menu = [0, 0]       # left menu button: held since, Back pulse until
         self.encoder = None
@@ -491,6 +492,7 @@ class Session:
                 [[round(math.degrees(a)) for a in f] for f in t['fov']])
             log(f'head at {px:.2f} {py:.2f} {pz:.2f}: guest origin placed under it')
         self.seq += 1
+        self.pose_at = time.monotonic()
         self.times[self.seq] = t['time_ns']
         self.times.pop(self.seq - 512, None)
         ox, oz = self.origin
@@ -626,8 +628,17 @@ class Session:
             # No stamped frames for 10 s: the compositor hung (acquiring a window buffer, say; the display then
             # freezes) or died. Restart the runtime; keepalive frames hold the headset connected meanwhile.
             if now - stamped_at > 10:
-                log('no stamped frames for 10 s: restarting the guest VR runtime')
-                restart_runtime()
+                # A rebooted guest has lost our helpers (no head pose: nothing draws); restarting only the runtime
+                # would kill the running app's VR session every 40 s.
+                if adb('shell', 'pgrep -f [I]njector').returncode != 0:
+                    log('no stamped frames and no guest injector (guest rebooted?): restarting guest helpers')
+                    start_guest()
+                elif now - self.pose_at > 2:
+                    stamped_at = now      # headset idle (taken off, asleep): no poses, so no frames; not a hang
+                    continue
+                else:
+                    log('no stamped frames for 10 s: restarting the guest VR runtime')
+                    restart_runtime()
                 stamped_at = now + 30
             if img is None:
                 # frozen display (idle scene): keep a frame a second flowing, or the
