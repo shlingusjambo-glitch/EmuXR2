@@ -10,6 +10,8 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 ROOT = Path(__file__).resolve().parents[2]
+import sys; sys.path.insert(0, str(ROOT / 'bridge'))
+from stream import Display   # the emulator display (gRPC with Vulkan composition, else shared memory)
 ADB = Path(os.environ.get('ANDROID_SDK_ROOT', Path.home() / 'Library/Android/sdk')) / 'platform-tools/adb'
 TOKEN = secrets.token_urlsafe(24)
 frame = b''
@@ -68,11 +70,7 @@ def video(handler):
         handler.connection.close(); return
     memory=None
     try:
-        name=adb('emu','screenrecord','webrtc','start','60').decode().splitlines()[0].strip()
-        fd=ctypes.CDLL(None).shm_open(name.encode(),os.O_RDONLY,0)
-        if fd<0:raise RuntimeError('Video memory unavailable')
-        memory=mmap.mmap(fd,os.fstat(fd).st_size,access=mmap.ACCESS_READ);os.close(fd)
-        w,h=struct.unpack('<2I',memory[:8])
+        display=Display()
         codec=av.CodecContext.create('libvpx','w');codec.width=720;codec.height=810
         codec.pix_fmt='yuv420p';codec.time_base=Fraction(1,1000000);codec.framerate=Fraction(60,1)
         codec.bit_rate=4000000;codec.thread_count=4
@@ -86,8 +84,9 @@ def video(handler):
             now=time.monotonic()
             if now<next_time:stop.wait(next_time-now)
             next_time=max(next_time+1/60,time.monotonic())
-            pixels=np.ndarray((h,w,4),dtype=np.uint8,buffer=memory,offset=24)
-            upright=np.rot90(pixels,-1) if h>w else pixels
+            current=display.current()
+            if current is None: continue
+            upright=current.view(np.uint8).reshape(current.shape+(4,))
             eye=np.ascontiguousarray(upright[:,:upright.shape[1]//2])
             frame=av.VideoFrame.from_ndarray(eye,format='bgra').reformat(width=720,height=810,format='yuv420p')
             frame.pts=int((time.monotonic()-start)*1000000)
@@ -139,12 +138,7 @@ def mjpeg(handler):
         handler.send_header('Connection', 'close')
         handler.end_headers()
 
-        name = adb('emu', 'screenrecord', 'webrtc', 'start', '60').decode().splitlines()[0].strip()
-        fd = ctypes.CDLL(None).shm_open(name.encode(), os.O_RDONLY, 0)
-        if fd < 0: raise RuntimeError('Video memory unavailable')
-        memory = mmap.mmap(fd, os.fstat(fd).st_size, access=mmap.ACCESS_READ)
-        os.close(fd)
-        w, h = struct.unpack('<2I', memory[:8])
+        display = Display()
 
         start = time.monotonic()
         next_time = start
@@ -154,8 +148,9 @@ def mjpeg(handler):
             now = time.monotonic()
             if now < next_time: stop.wait(next_time - now)
             next_time = max(next_time + 1/60, time.monotonic())
-            pixels = np.ndarray((h, w, 4), dtype=np.uint8, buffer=memory, offset=24)
-            upright = np.rot90(pixels, -1) if h > w else pixels
+            current = display.current()
+            if current is None: continue
+            upright = current.view(np.uint8).reshape(current.shape + (4,))
             eye = np.ascontiguousarray(upright[:, :upright.shape[1]//2, :3])
             # Eye is BGRA -> convert to RGB for JPEG
             img = Image.fromarray(eye[:, :, ::-1])

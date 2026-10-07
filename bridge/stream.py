@@ -163,7 +163,33 @@ def start_guest():
         log('warning: guest pose injector not listening yet; poses will reconnect on first send')
 
 
-class Display:
+def emulator_grpc():
+    """(port, token or None) of the running emulator's gRPC service, from its discovery file, or None."""
+    run = os.path.expanduser('~/Library/Caches/TemporaryItems/avd/running')
+    for name in os.listdir(run) if os.path.isdir(run) else ():
+        try:
+            info = dict(l.split('=', 1) for l in open(os.path.join(run, name)).read().splitlines() if '=' in l)
+        except OSError:
+            continue
+        if info.get('port.serial') == EMU.split('-')[-1] and 'grpc.port' in info:
+            token = info.get('grpc.token')
+            if not token:   # -grpc-use-token: the console's auth token
+                try:
+                    token = open(os.path.expanduser('~/.emulator_console_auth_token')).read().strip() or None
+                except OSError:
+                    pass
+            return int(info['grpc.port']), token
+    return None
+
+
+def Display():
+    """The emulator's display: its gRPC frame stream when the emulator serves one (needed with Vulkan composition,
+    which has no GL readback for the shared-memory recorder), else the shared-memory recorder."""
+    g = emulator_grpc()
+    return GrpcDisplay(*g) if g else ShmDisplay()
+
+
+class ShmDisplay:
     """The emulator's shared framebuffer: header (width, height, fps, frame counter, ...) then BGRA pixels."""
 
     def __init__(self):
@@ -200,6 +226,54 @@ class Display:
         """The current upright image regardless of the frame counter, or None."""
         img = self.snapshot()
         return img if img.shape == (CAP_H, CAP_W) else None
+
+
+class GrpcDisplay(ShmDisplay):
+    """Frames the emulator streams over gRPC into a memory-mapped file (RGBA; made BGRA when copied)."""
+
+    def __init__(self, port, token=None):
+        sys.path.insert(0, os.path.join(OUT, 'grpc'))
+        import grpc
+        try:
+            import emulator_controller_pb2 as pb, emulator_controller_pb2_grpc as rpc
+        except ImportError:   # stubs are generated from the SDK's own proto, once
+            from grpc_tools import protoc
+            os.makedirs(os.path.join(OUT, 'grpc'), exist_ok=True)
+            sdk = os.path.join(os.path.dirname(os.path.dirname(ADB)), 'emulator', 'lib')
+            protoc.main(['protoc', '-I' + sdk, '--python_out=' + os.path.join(OUT, 'grpc'),
+                         '--grpc_python_out=' + os.path.join(OUT, 'grpc'), 'emulator_controller.proto'])
+            import emulator_controller_pb2 as pb, emulator_controller_pb2_grpc as rpc
+        self.stub = rpc.EmulatorControllerStub(grpc.insecure_channel(
+            f'localhost:{port}', options=[('grpc.max_receive_message_length', 64 << 20)]))
+        self.auth = [('authorization', 'Bearer ' + token)] if token else None
+        shot = self.stub.getScreenshot(pb.ImageFormat(format=pb.ImageFormat.RGBA8888), metadata=self.auth)
+        w, h = shot.format.width, shot.format.height
+        self.path = os.path.join(os.environ.get('TMPDIR', '/tmp'), f'emuxr2-frame-{os.getpid()}')
+        with open(self.path, 'wb') as f:
+            f.truncate(w * h * 4)
+        f = open(self.path, 'r+b')
+        self.m = mmap.mmap(f.fileno(), w * h * 4, access=mmap.ACCESS_READ)
+        f.close()
+        self.w, self.h, self.seq = w, h, 0
+        self.px = np.frombuffer(self.m, np.uint32, w * h).reshape(h, w)
+        self.fmt = pb.ImageFormat(format=pb.ImageFormat.RGBA8888, transport=pb.ImageTransport(
+            channel=pb.ImageTransport.MMAP, handle='file://' + self.path))
+        threading.Thread(target=self._follow, daemon=True).start()
+
+    def _follow(self):
+        while True:
+            try:
+                for img in self.stub.streamScreenshot(self.fmt, metadata=self.auth):
+                    self.seq += 1
+            except Exception as e:   # emulator restarting: keep trying
+                log('gRPC display stream ended:', e)
+                time.sleep(1)
+
+    def counter(self):
+        return self.seq
+
+    def snapshot(self):
+        return pixels.rgba_to_bgra(pixels.snapshot(self.px))
 
 
 def pose_number(img):

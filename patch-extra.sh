@@ -7,7 +7,8 @@ for l in libEGL_macvr libGLESv1_CM_macvr libGLESv2_macvr; do put emu/emu_vendor.
 # ANGLE kept in angle/ (from the emulator's API 33 image) when present
 [ -f angle/libGLESv2_angle.so ] && for l in libEGL_angle libGLESv1_CM_angle libGLESv2_angle; do put emu/emu_vendor.img angle/$l.so /lib64/egl/$l.so u:object_r:same_process_hal_file:s0; done
 x emu/emu_vendor.img /etc/init/hw/init.ranchu.rc work/init.ranchu.rc
-sed -i '' 's/setprop ro.hardware.egl ${ro.boot.hardwareegl:-emulation}/setprop ro.hardware.egl ${ro.boot.hardwareegl:-macvr}/' work/init.ranchu.rc
+# always our EGL shim: with -feature GuestUsesAngle (Vulkan-backed host color buffers) the emulator passes hardwareegl=angle
+sed -i '' 's/setprop ro.hardware.egl ${ro.boot.hardwareegl:-emulation}/setprop ro.hardware.egl macvr/' work/init.ranchu.rc
 put emu/emu_vendor.img work/init.ranchu.rc /etc/init/hw/init.ranchu.rc
 # MacVR's stand-ins for the Quest's vendor HALs (hardware the emulator doesn't have), plus the HIDL interface
 # libraries they implement, copied from the user's own firmware's vendor partition

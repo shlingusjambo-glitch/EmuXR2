@@ -10,7 +10,7 @@ class Buffer(ctypes.Structure):
                 ('width', ctypes.c_ulong), ('row_bytes', ctypes.c_size_t)]
 
 
-_rotate = None
+_rotate = _permute = None
 if sys.platform == 'darwin':
     try:
         _accelerate = ctypes.CDLL('/System/Library/Frameworks/Accelerate.framework/Accelerate')
@@ -18,6 +18,9 @@ if sys.platform == 'darwin':
         _rotate.argtypes = [ctypes.POINTER(Buffer), ctypes.POINTER(Buffer), ctypes.c_uint8,
                            ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint32]
         _rotate.restype = ctypes.c_long
+        _permute = _accelerate.vImagePermuteChannels_ARGB8888
+        _permute.argtypes = [ctypes.POINTER(Buffer), ctypes.POINTER(Buffer), ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint32]
+        _permute.restype = ctypes.c_long
     except (OSError, AttributeError):
         pass
 
@@ -36,3 +39,14 @@ def snapshot(pixels):
         if error == 0:
             return result
     return np.array(np.rot90(pixels, -1), copy=True, order='C')
+
+
+def rgba_to_bgra(img):
+    """Swap red and blue in place (the emulator's gRPC frames are RGBA; the stream works in BGRA)."""
+    h, w = img.shape
+    if _permute is not None and img.flags.c_contiguous:
+        b = Buffer(img.ctypes.data, h, w, img.strides[0])
+        if _permute(ctypes.byref(b), ctypes.byref(b), (ctypes.c_uint8 * 4)(2, 1, 0, 3), 0) == 0:
+            return img
+    img[:] = (img & 0xFF00FF00) | ((img & 0xFF) << 16) | ((img >> 16) & 0xFF)
+    return img

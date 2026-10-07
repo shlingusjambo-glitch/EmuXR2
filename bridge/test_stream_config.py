@@ -193,7 +193,7 @@ for eye in (0, 1):
 
 # Shared framebuffer snapshots own their pixels, keep the correct eye orientation, and reject counter races.
 for w, h in ((6, 4), (4, 6)):
-    display = object.__new__(st.Display)
+    display = object.__new__(st.ShmDisplay)
     display.w, display.h = w, h
     display.px = _np.arange(w * h, dtype=_np.uint32).reshape(h, w)
     expected = display.px.copy() if w > h else _np.rot90(display.px, -1).copy()

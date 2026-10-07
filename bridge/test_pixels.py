@@ -23,6 +23,13 @@ class PixelSnapshotTest(unittest.TestCase):
         source = np.arange(500, dtype=np.uint32).reshape(25, 20)[:, ::2]
         np.testing.assert_array_equal(pixels.snapshot(source), np.rot90(source, -1))
 
+    def test_rgba_to_bgra_native_and_fallback(self):
+        rgba = np.frombuffer(bytes([1, 2, 3, 4, 10, 20, 30, 40] * 6), np.uint32).reshape(3, 4).copy()
+        bgra = np.frombuffer(bytes([3, 2, 1, 4, 30, 20, 10, 40] * 6), np.uint32).reshape(3, 4)
+        np.testing.assert_array_equal(pixels.rgba_to_bgra(rgba.copy()), bgra)
+        with patch.object(pixels, '_permute', None):
+            np.testing.assert_array_equal(pixels.rgba_to_bgra(rgba.copy()), bgra)
+
 
 if __name__ == '__main__':
     unittest.main()

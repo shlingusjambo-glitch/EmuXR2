@@ -40,7 +40,7 @@ GPL-3.0-only. See `LICENSE`.
 Boots the Quest's Android to `sys.boot_completed`. Meta's VR runtime, VrShell, ShellEnv, SystemUX, Horizon and Store
 all run. Tracking accepts a stationary desktop pose through Meta's `TrackingDataInjection` service.
 The Bubbles home, universal dock, coach cards and guest mouse cursor render in both eyes.
-Boots show a live emulator window by default (`HEADLESS=1` hides it).
+Boots are headless by default: the Mac-side emulator window costs games about 20% fps. `WINDOW=1` shows it.
 
 Settings now renders correctly in both eyes (`screenshots/34-settings-user-confirmed.png`).
 The compositor's external-image programs retained optional vertex sampler2D uniforms on

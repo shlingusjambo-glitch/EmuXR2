@@ -1,7 +1,8 @@
 #!/bin/sh
 set -eu
 HERE=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
-PYTHON=${EMUXR_PYTHON:-python3}
+VENV="$HERE/../../bridge/.venv/bin/python"
+[ -x "$VENV" ] && PYTHON=${EMUXR_PYTHON:-$VENV} || PYTHON=${EMUXR_PYTHON:-python3}
 if ! "$PYTHON" -c 'import av, numpy' >/dev/null 2>&1; then
     BUNDLED="$HOME/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"
     if [ -x "$BUNDLED" ] && "$BUNDLED" -c 'import av, numpy' >/dev/null 2>&1; then PYTHON=$BUNDLED

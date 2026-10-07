@@ -1,6 +1,11 @@
 #!/bin/sh
 # rebuild the emulator disk from work/ images and boot with a live window; log -> boot.log
 set -e
+# no emulator window by default: drawing it on the Mac costs games ~20% fps (Ape Sprint 25 -> 30); WINDOW=1 shows it
+[ "${WINDOW:-0}" = 1 ] && HEADLESS= || HEADLESS=1
+# The host composes and keeps display buffers in Vulkan (no GL copy of every buffer the guest renders: Ape Sprint
+# 30 -> 54 fps); the display then streams over gRPC (token-protected) since its shared-memory recorder needs GL.
+MACVR_EMUARGS="-feature GuestUsesAngle,VulkanNativeSwapchain -grpc 8554 -grpc-use-token"
 H=$(cd "$(dirname "$0")" && pwd); cd ~/MacVRFirmware; S=~/Library/Android/sdk/system-images/android-32/google_apis/arm64-v8a
 # Wait for the old VM to release its disk and AVD locks before rebuilding.
 pids=$(pgrep -f 'qemu-system-aarch64.*-avd horizon( |$)' || true)
@@ -39,7 +44,7 @@ for kv in "hw.gltransport=asg" "hw.lcd.vsync=72" "hw.cpu.ncore=6" "hw.lcd.width=
     if grep -q "^$k" "$AVD"; then sed -i '' "s/^$k.*/$k = $v/" "$AVD"; else echo "$k = $v" >> "$AVD"; fi
 done
 if [ "${FOREGROUND:-0}" = 1 ]; then
-    exec ~/Library/Android/sdk/emulator/emulator -avd horizon -sysdir ~/MacVRFirmware/sysdir -no-snapshot -no-boot-anim ${WIPE-} ${HEADLESS:+-no-window} -gpu ${GPU-host} -no-metrics -crash-report-mode never -logcat "*:W" -logcat-output ~/MacVRFirmware/logcat.txt $EMUARGS
+    exec ~/Library/Android/sdk/emulator/emulator -avd horizon -sysdir ~/MacVRFirmware/sysdir -no-snapshot -no-boot-anim ${WIPE-} ${HEADLESS:+-no-window} -gpu ${GPU-host} -no-metrics -crash-report-mode never -logcat "*:W" -logcat-output ~/MacVRFirmware/logcat.txt $MACVR_EMUARGS $EMUARGS
 fi
-nohup ~/Library/Android/sdk/emulator/emulator -avd horizon -sysdir ~/MacVRFirmware/sysdir -no-snapshot -no-boot-anim ${WIPE-} -show-kernel ${HEADLESS:+-no-window} -gpu ${GPU-host} -no-metrics -crash-report-mode never -logcat "*:W" -logcat-output ~/MacVRFirmware/logcat.txt $EMUARGS > boot.log 2>&1 &
+nohup ~/Library/Android/sdk/emulator/emulator -avd horizon -sysdir ~/MacVRFirmware/sysdir -no-snapshot -no-boot-anim ${WIPE-} -show-kernel ${HEADLESS:+-no-window} -gpu ${GPU-host} -no-metrics -crash-report-mode never -logcat "*:W" -logcat-output ~/MacVRFirmware/logcat.txt $MACVR_EMUARGS $EMUARGS > boot.log 2>&1 &
 echo booting
