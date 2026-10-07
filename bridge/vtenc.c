@@ -90,11 +90,12 @@ static void *commands(void *u) {
     return NULL;
 }
 
-// the stamp the compositor writes along the bottom-left edge (green bits 1011, then a 32-bit pose number), or -1
-static int64_t readStamp(const uint8_t *rgba, int w, int h) {
-    const uint8_t *row = rgba + (size_t)(h - MARK / 2) * w * 4;
-    int bits[MARK_BLOCKS];
-    for (int i = 0; i < MARK_BLOCKS; i++) bits[i] = row[(MARK / 2 + i * MARK) * 4 + 1] > 127;
+// The pose-number stamp the compositor writes along the bottom-left edge (green bits 1011, then a 32-bit pose
+// number) and a frame signature, read on the raw portrait frame (rw x rh = h x w of the upright one): upright
+// (r, c) is raw (c', r) with c' = rh - 1 - c, so skipped frames are never rotated.
+static int64_t readStampRaw(const uint8_t *raw, int rw, int rh) {
+    int bits[MARK_BLOCKS], r = rw - MARK / 2;
+    for (int i = 0; i < MARK_BLOCKS; i++) bits[i] = raw[((size_t)(rh - 1 - (MARK / 2 + i * MARK)) * rw + r) * 4 + 1] > 127;
     if (!(bits[0] && !bits[1] && bits[2] && bits[3])) return -1;
     int64_t v = 0;
     for (int i = 4; i < MARK_BLOCKS; i++) v |= (int64_t)bits[i] << (i - 4);
@@ -148,6 +149,25 @@ int main(int argc, char **argv) {
     const void *pv[] = {CFNumberCreate(0, kCFNumberIntType, &fmt), CFNumberCreate(0, kCFNumberIntType, &W), CFNumberCreate(0, kCFNumberIntType, &H), ios};
     CVPixelBufferPoolCreate(0, NULL, CFDictionaryCreate(0, pk, pv, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks), &pool);
     (void)attrs;
+    // Hardware path: one CPU pass (RGBA -> BGRA into an IOSurface, stamp covered), then the rotation and the NV12
+    // conversion on the Mac's image hardware. VTENC_CPU=1: rotate and convert with vImage instead.
+    int cpu = getenv("VTENC_CPU") != NULL;
+    VTPixelRotationSessionRef rot = NULL; VTPixelTransferSessionRef xfer = NULL;
+    CVPixelBufferPoolRef portraitPool = NULL, landscapePool = NULL;
+    if (!cpu) {
+        int bgra = kCVPixelFormatType_32BGRA;
+        const void *kv1[] = {CFNumberCreate(0, kCFNumberIntType, &bgra), CFNumberCreate(0, kCFNumberIntType, &H), CFNumberCreate(0, kCFNumberIntType, &W), ios};
+        const void *kv2[] = {kv1[0], CFNumberCreate(0, kCFNumberIntType, &W), CFNumberCreate(0, kCFNumberIntType, &H), ios};
+        CVPixelBufferPoolCreate(0, NULL, CFDictionaryCreate(0, pk, kv1, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks), &portraitPool);
+        CVPixelBufferPoolCreate(0, NULL, CFDictionaryCreate(0, pk, kv2, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks), &landscapePool);
+        if (VTPixelRotationSessionCreate(0, &rot) || VTPixelTransferSessionCreate(0, &xfer)) cpu = 1;
+        else {
+            VTSessionSetProperty(rot, kVTPixelRotationPropertyKey_Rotation, kVTRotation_CW90);
+            VTSessionSetProperty(xfer, kVTPixelTransferPropertyKey_DestinationYCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_601_4);
+        }
+        if (cpu) fprintf(stderr, "vtenc: no hardware rotation/transfer; converting with vImage\n");
+    }
+    const uint8_t rgbaToBgra[4] = {2, 1, 0, 3};
 
     inflight = dispatch_semaphore_create(2);
     pthread_t cmd; pthread_create(&cmd, NULL, commands, NULL);
@@ -165,25 +185,55 @@ int main(int argc, char **argv) {
         if (cur == last) { usleep(500); continue; }
         last = cur;
         vImage_Buffer src = {(void *)raw, (vImagePixelCount)W, (vImagePixelCount)H, (size_t)H * 4};   // portrait
+        int64_t stamp = readStampRaw(raw, H, W);
+        uint64_t sig = signature(raw, H, W);
+        if (*seq != cur) continue;   // written while reading: take the next one
+        seen++;
+        if (stamp >= 0) seenStamp = stamp;
+        int wait = atomic_load(&idle) || stamp < 0 || (stamp == lastStamp && sig == lastSig);
+        if (wait && t - lastEncode < 1) continue;   // repeats, unstamped or untracked frames: one a second
+        CVPixelBufferRef pb;
+        if (!cpu) {
+            CVPixelBufferRef portrait, landscape;
+            if (CVPixelBufferPoolCreatePixelBuffer(0, portraitPool, &portrait)) continue;
+            CVPixelBufferLockBaseAddress(portrait, 0);
+            uint8_t *pp = CVPixelBufferGetBaseAddress(portrait); size_t prb = CVPixelBufferGetBytesPerRow(portrait);
+            vImage_Buffer pdst = {pp, (vImagePixelCount)W, (vImagePixelCount)H, prb};
+            vImagePermuteChannels_ARGB8888(&src, &pdst, rgbaToBgra, TILE);
+            // cover the stamp with the row above it (black there shows when the headset stretches the edge); in
+            // portrait coordinates that row is column H - MARK - 1, over the stamp's columns H - MARK .. H - 1
+            for (int c = 0; c < MARK_BLOCKS * MARK; c++) {
+                uint32_t *row = (uint32_t *)(pp + (size_t)(W - 1 - c) * prb);
+                for (int r = H - MARK; r < H; r++) row[r] = row[H - MARK - 1];
+            }
+            CVPixelBufferUnlockBaseAddress(portrait, 0);
+            if (*seq != cur) { CVPixelBufferRelease(portrait); continue; }
+            if (CVPixelBufferPoolCreatePixelBuffer(0, landscapePool, &landscape)) { CVPixelBufferRelease(portrait); continue; }
+            OSStatus e1 = VTPixelRotationSessionRotateImage(rot, portrait, landscape);
+            CVPixelBufferRelease(portrait);
+            if (e1 || CVPixelBufferPoolCreatePixelBuffer(0, pool, &pb)) { CVPixelBufferRelease(landscape); fprintf(stderr, "vtenc: rotate %d\n", (int)e1); continue; }
+            OSStatus e2 = VTPixelTransferSessionTransferImage(xfer, landscape, pb);
+            CVPixelBufferRelease(landscape);
+            if (e2) { CVPixelBufferRelease(pb); fprintf(stderr, "vtenc: transfer %d\n", (int)e2); continue; }
+            CVPixelBufferLockBaseAddress(pb, 0);
+            goto converted;
+        }
+        {
         vImage_Buffer dst = {upright, (vImagePixelCount)H, (vImagePixelCount)W, (size_t)W * 4};
         uint8_t black[4] = {0};
         vImageRotate90_ARGB8888(&src, &dst, kRotate90DegreesClockwise, black, TILE);
-        if (*seq != cur) continue;   // written while copying: take the next one
-        seen++;
-        int64_t stamp = readStamp(upright, W, H);
-        if (stamp >= 0) seenStamp = stamp;
-        uint64_t sig = signature(upright, W, H);
-        int wait = atomic_load(&idle) || stamp < 0 || (stamp == lastStamp && sig == lastSig);
-        if (wait && t - lastEncode < 1) continue;   // repeats, unstamped or untracked frames: one a second
         // cover the stamp with the row above it (black there shows when the headset stretches the edge)
         for (int y = H - MARK; y < H; y++) memcpy(upright + (size_t)y * W * 4, upright + (size_t)(H - MARK - 1) * W * 4, MARK_BLOCKS * MARK * 4);
-        CVPixelBufferRef pb;
         if (CVPixelBufferPoolCreatePixelBuffer(0, pool, &pb)) continue;
         CVPixelBufferLockBaseAddress(pb, 0);
         vImage_Buffer argb = {upright, (vImagePixelCount)H, (vImagePixelCount)W, (size_t)W * 4};
+        vImage_Buffer y0 = {CVPixelBufferGetBaseAddressOfPlane(pb, 0), (vImagePixelCount)H, (vImagePixelCount)W, CVPixelBufferGetBytesPerRowOfPlane(pb, 0)};
+        vImage_Buffer c0 = {CVPixelBufferGetBaseAddressOfPlane(pb, 1), (vImagePixelCount)H / 2, (vImagePixelCount)W / 2, CVPixelBufferGetBytesPerRowOfPlane(pb, 1)};
+        vImageConvert_ARGB8888To420Yp8_CbCr8(&argb, &y0, &c0, &info, rgbaAsArgb, TILE);
+        }
+    converted:;
         vImage_Buffer y = {CVPixelBufferGetBaseAddressOfPlane(pb, 0), (vImagePixelCount)H, (vImagePixelCount)W, CVPixelBufferGetBytesPerRowOfPlane(pb, 0)};
         vImage_Buffer c = {CVPixelBufferGetBaseAddressOfPlane(pb, 1), (vImagePixelCount)H / 2, (vImagePixelCount)W / 2, CVPixelBufferGetBytesPerRowOfPlane(pb, 1)};
-        vImageConvert_ARGB8888To420Yp8_CbCr8(&argb, &y, &c, &info, rgbaAsArgb, TILE);
         float g = atomic_load(&gain);
         if (g < 0.995f) {
             if (g != lastGain) {
