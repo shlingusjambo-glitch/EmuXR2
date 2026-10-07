@@ -17,12 +17,15 @@
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "MacVR-EGL", __VA_ARGS__)
 
 static void *real(const char *n) { return dlsym(RTLD_NEXT, n); }
+static int isCompositor(void);
+static void hookRuntime(void);
 
 // eglCreateContext: on EGL_BAD_ATTRIBUTE, drop the attributes ANGLE doesn't know (one at a time) and retry
 EGLContext eglCreateContext(EGLDisplay d, EGLConfig c, EGLContext share, const EGLint *attr) {
     static EGLContext (*f)(EGLDisplay, EGLConfig, EGLContext, const EGLint *);
     static EGLint (*err)(void);
     if (!f) { f = real("eglCreateContext"); err = real("eglGetError"); }
+    if (isCompositor()) hookRuntime();   // before the first swapchain: a restarted runtime serves its clients at once
     EGLContext ctx = f(d, c, share, attr);
     if (ctx != EGL_NO_CONTEXT || !attr) return ctx;
     {   EGLint e = err(), rt = 0, id = 0, st = 0, r = 0, g = 0, b = 0, al = 0, dp = 0;
@@ -693,7 +696,7 @@ static int patchGot(struct dl_phdr_info *info, size_t size, void *data) {
             if (d->d_tag == DT_PLTRELSZ) relsz = d->d_un.d_val;
         }
         for (size_t i = 0; rel && sym && str && i < relsz / sizeof *rel; i++) {
-            if (strcmp(str + sym[ELF64_R_SYM(rel[i].r_info)].st_name, hooks[h].sym)) continue;
+            if (*hooks[h].orig || strcmp(str + sym[ELF64_R_SYM(rel[i].r_info)].st_name, hooks[h].sym)) continue;
             void **got = (void **)(info->dlpi_addr + rel[i].r_offset);
             uintptr_t page = (uintptr_t)got & ~(uintptr_t)4095;
             if (mprotect((void *)page, 4096, PROT_READ | PROT_WRITE)) { LOG("hook %s: mprotect failed", hooks[h].sym); break; }
@@ -705,4 +708,8 @@ static int patchGot(struct dl_phdr_info *info, size_t size, void *data) {
     }
     return 0;
 }
-static void hookRuntime(void) { static int done; if (!done) { done = 1; dl_iterate_phdr(patchGot, NULL); } }
+static void hookRuntime(void) {   // until both are in (libvrruntimeservice may load after the first EGL call)
+    static int done; if (done) return;
+    dl_iterate_phdr(patchGot, NULL);
+    done = realNewReader && realStSize;
+}
