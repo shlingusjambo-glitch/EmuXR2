@@ -42,6 +42,7 @@ struct CameraProperties { uint32_t id; hidl_string a, b; };   // 40 bytes (libvr
 //   @0x128 u64 flags: 0x40 controller, 0x20 left / 0x10 right (one slot each), 0x200 Constellation (Touch), 0x400 self-tracked (Pro); trackingservice aborts without one
 struct PairedControllerInfo {
     uint8_t b[0x1c0];
+    uint32_t& type() { return *reinterpret_cast<uint32_t*>(b); }   // ControllerType: picks the controller model
     uint64_t& addr() { return *reinterpret_cast<uint64_t*>(b + 0x08); }
     uint8_t& connected() { return b[0x10]; }
     float& battery() { return *reinterpret_cast<float*>(b + 0x14); }

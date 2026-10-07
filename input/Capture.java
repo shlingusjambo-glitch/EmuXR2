@@ -13,7 +13,7 @@ import java.lang.reflect.Method;
  * compositor's own undistorted render, both eyes side by side: the path Quest casting uses) into a SurfaceFlinger
  * layer that covers the emulator's display, so the host reads it from the emulator's framebuffer. The request goes
  * out as the trusted system package Meta's receiver expects; root may create a PendingIntent for any package.
- * Usage (root): app_process / Capture <capture width> <capture height> <display width> <display height>
+ * Usage (root): app_process / Capture <capture width> <capture height> <display width> <display height> [aspect fov]
  */
 public class Capture {
     static final String ACTION = "com.oculus.systemactivities.BEGIN_VIDEO_CAPTURE_WITH_SURFACE";
@@ -59,6 +59,7 @@ public class Capture {
     public static void main(String[] argv) throws Exception {
         int w = Integer.parseInt(argv[0]), h = Integer.parseInt(argv[1]);
         int dw = Integer.parseInt(argv[2]), dh = Integer.parseInt(argv[3]);
+        float aspectFov = argv.length > 4 ? Float.parseFloat(argv[4]) : 0f;
         Looper.prepareMainLooper();
         layer = new SurfaceControl.Builder().setName("EmuXR2 capture").setBufferSize(w, h)
                 .setFormat(PixelFormat.RGBA_8888).setOpaque(true).build();
@@ -85,6 +86,7 @@ public class Capture {
         i.putExtra("lift_inhibit", true);
         i.putExtra("video_capture_eye_selection", BOTH_EYES);
         i.putExtra("video_capture_frame_rate_divisor", 1);
+        i.putExtra("video_capture_aspect_ratio_fov", aspectFov);
         broadcast(am, i);
         System.out.println("capture " + w + "x" + h + " on the " + dw + "x" + dh + " display");
         Looper.loop();

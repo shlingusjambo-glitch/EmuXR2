@@ -61,6 +61,7 @@ def parse_tracking(payload):
     return {
         'time_ns': struct.unpack('<Q', payload[:8])[0],
         'head': struct.unpack('<7f', payload[8:36]),
+        'fov': tuple(struct.unpack('<4f', payload[o + 28:o + 44]) for o in (36, 80)),   # per eye: left right up down
         'hands': (hand_at(124), hand_at(204)),
     }
 

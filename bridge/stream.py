@@ -29,6 +29,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import quest_proto as qp
+import unknown_sources
 
 ADB = os.environ.get('ANDROID_SDK_ROOT', os.path.expanduser('~/Library/Android/sdk')) + '/platform-tools/adb'
 EMU = os.environ.get('EMUXR2_SERIAL', 'emulator-5554')
@@ -37,10 +38,12 @@ OUT = os.path.join(HERE, '..', 'input', 'out')
 INJECTOR_PORT, QUEST_PORT, AUDIO_PORT = 7791, 9945, 7793
 AUDIO_CHUNK = 1920   # 10 ms of 48 kHz stereo s16le (common/vr4mac.h VR4_AUDIO)
 
-# The capture: 1920x1080, both eyes side by side. Measured projection (calibration: known head rotations,
-# matched features, p' = K R K^-1 p): square pixels, f = 572.3 px, optical centre x 501.6 / 458.4, y 587.6.
-CAP_W, CAP_H, EYE_W = 1920, 1080, 960
-ENC_H = 1088   # encoded height: 16-aligned (the Quest 1 AVC decoder drops frames at 1080); extra rows are black
+# The capture: both eyes side by side, 1280x1600 each (the emulator's panel is 2560x1600). Horizon renders it with a
+# horizontal field of view of 80 degrees plus the request's "video_capture_aspect_ratio_fov"; CAPTURE_FOV_ADJ widens it
+# to the edge of Horizon's own eye images (wider shows black where the eyes rendered nothing).
+CAP_W, CAP_H, EYE_W = 2560, 1600, 1280
+ENC_H = CAP_H   # encoded height: 16-aligned (the Quest 1 AVC decoder drops frames otherwise)
+CAPTURE_FOV_ADJ = float(os.environ.get('EMUXR2_CAPTURE_FOV_ADJ', 9.4))
 # Horizon's raw tracking space has its floor at y = -1.675 without a Guardian (the runtime logs RawFloorHeight); the
 # Quest's stage space has it at 0. Injected heights are moved onto the guest's floor so eye height stays true.
 GUEST_FLOOR = float(os.environ.get('EMUXR2_GUEST_FLOOR', -1.675))
@@ -48,11 +51,16 @@ GUEST_FLOOR = float(os.environ.get('EMUXR2_GUEST_FLOOR', -1.675))
 # bridge/calibrate_poses.py: 60 degrees about x, 3 cm down, 4 cm back); the headset's view pose is its IMU pose. The
 # Quest's grip poses are injected as grip * GRIP_FROM_IMU^-1 so the guest's controllers land where the real ones are.
 GRIP_FROM_IMU = ((0.0, -0.03, 0.04), (math.sin(math.radians(30)), 0.0, 0.0, math.cos(math.radians(30))))
-FOCAL, CENTRE_X, CENTRE_Y = 572.3, (501.6, 458.4), 587.6
+# Measured projection (bridge/calibrate_capture.py: known head rotations, p' = K R K^-1 p) at the default 9.4 degrees:
+# square pixels, f = 662.7 px, optical centre x 674.3 / 616.6, y 776.8. Another adjustment scales the focal length with
+# the field of view and keeps the centre's offsets as tangents.
+FOCAL = 662.7 * math.tan(math.radians(89.4) / 2) / math.tan(math.radians(80 + CAPTURE_FOV_ADJ) / 2)
+CENTRE_X = tuple(EYE_W / 2 + t * FOCAL for t in (0.0518, -0.0353))
+CENTRE_Y = CAP_H / 2 - 0.035 * FOCAL
 FOV = [[math.atan(-cx / FOCAL), math.atan((EYE_W - cx) / FOCAL),
         math.atan(CENTRE_Y / FOCAL), math.atan(-(ENC_H - CENTRE_Y) / FOCAL)] for cx in CENTRE_X]
 MARK_BLOCKS, MARK = 36, 8   # pose-number stamp: 36 blocks of 8x8 px along the bottom-left edge
-FPS, BITRATE = 60, 25_000_000
+FPS, BITRATE = 60, 40_000_000
 DEFAULT_PROF = {'codec': 'h264', 'eye_w': EYE_W, 'eye_h': ENC_H,
                 'fps': FPS, 'bitrate': BITRATE, 'device': 'default'}
 LOG = open('/tmp/emuxr2-stream.log', 'a', buffering=1)
@@ -110,6 +118,7 @@ def start_guest(capture_only=False):
                  '{ settings put system screen_brightness_for_vr 255; setprop persist.emuxr2.brightness 1; }')
     if not capture_only:
         prepare_library()
+        unknown_sources.main()   # sideloaded games in the Library's Unknown Sources without a Meta account
     for dex in ('injector', 'capture', 'audio'):
         adb('push', f'{OUT}/{dex}.dex', f'/data/local/tmp/{dex}.dex')
     which = 'Capture' if capture_only else '(Injector|Capture|Audio)'
@@ -125,7 +134,7 @@ def start_guest(capture_only=False):
                      '> /data/local/tmp/audio.log 2>&1 < /dev/null &')
         adb('forward', f'tcp:{AUDIO_PORT}', f'tcp:{AUDIO_PORT}')
     adb('shell', f'CLASSPATH=/data/local/tmp/capture.dex setsid nohup app_process / Capture {CAP_W} {CAP_H} '
-                 f'{CAP_W} {CAP_H} > /data/local/tmp/capture.log 2>&1 < /dev/null &')
+                 f'{CAP_W} {CAP_H} {CAPTURE_FOV_ADJ} > /data/local/tmp/capture.log 2>&1 < /dev/null &')
     adb('forward', f'tcp:{INJECTOR_PORT}', f'tcp:{INJECTOR_PORT}')
     if not capture_only and not wait_injector():
         log('warning: guest pose injector not listening yet; poses will reconnect on first send')
@@ -175,6 +184,36 @@ def pose_number(img):
     if list(bits[:4]) != [True, False, True, True]:
         return None
     return sum(int(b) << i for i, b in enumerate(bits[4:]))
+
+
+def hide_stamp(frame):
+    """Cover the pose-number stamp with the row above it (black there shows when the headset stretches the edge)."""
+    frame[CAP_H - MARK:CAP_H, :MARK_BLOCKS * MARK] = frame[CAP_H - MARK - 1, :MARK_BLOCKS * MARK]
+
+
+CLIENT = 'com.vr4mac.client'
+CLIENT_APK = os.environ.get('EMUXR2_CLIENT_APK', os.path.join(HERE, '..', '..', 'android', 'app', 'build', 'outputs',
+                                                              'apk', 'debug', 'app-debug.apk'))
+
+
+def update_client():
+    """Replace an outdated headset client (one that can't show frames at their own field of view, so the world looks
+    magnified) with the one built from this repository, over USB, and start it."""
+    quest = quest_serial()
+    if not quest or not os.path.exists(CLIENT_APK):
+        log('headset client is outdated (no field-of-view support: the view looks zoomed in); install', CLIENT_APK)
+        return
+    log(f'headset client is outdated: installing {CLIENT_APK} on {quest}')
+    r = adb('install', '-r', '-g', CLIENT_APK, serial=quest, timeout=120)
+    if 'INSTALL_FAILED_UPDATE_INCOMPATIBLE' in r.stdout + r.stderr:   # signed with another key: replace it
+        adb('uninstall', CLIENT, serial=quest, timeout=60)
+        r = adb('install', '-g', CLIENT_APK, serial=quest, timeout=120)
+    if 'Success' not in r.stdout:
+        log('client update failed:', (r.stdout + r.stderr).strip()[-300:])
+        return
+    adb('reverse', f'tcp:{QUEST_PORT}', f'tcp:{QUEST_PORT}', serial=quest)
+    adb('shell', f'am start -n {CLIENT}/.MainActivity', serial=quest)
+    log('headset client updated and restarted')
 
 
 class Guest:
@@ -388,6 +427,9 @@ class Session:
         self.need_idr = True
         self.send(2, json.dumps(config).encode())
         log('CONFIG:', json.dumps(config))
+        if 'fov' not in hello.get('features', ()) and not getattr(Session, 'updating', None):
+            Session.updating = threading.Thread(target=update_client, daemon=True)   # once per streamer run
+            Session.updating.start()
         if hello.get('audio') and not (self.audio_thread and self.audio_thread.is_alive()):
             self.audio_thread = threading.Thread(target=self.audio, daemon=True)
             self.audio_thread.start()
@@ -399,6 +441,8 @@ class Session:
             return
         if self.origin is None:
             self.origin = (px, pz)
+            log('headset eye fields of view (left right up down, degrees):',
+                [[round(math.degrees(a)) for a in f] for f in t['fov']])
             log(f'head at {px:.2f} {py:.2f} {pz:.2f}: guest origin placed under it')
         self.seq += 1
         self.times[self.seq] = t['time_ns']
@@ -543,7 +587,7 @@ class Session:
                             time.sleep(0.001)
                             continue
                         padded[:CAP_H] = cur
-                        padded[CAP_H - MARK:CAP_H, :MARK_BLOCKS * MARK] = 0
+                        hide_stamp(padded)
                         last_pixels = padded.copy()
                     self.emit(last_pixels, last_when)
                     sent_at, behind, n = now, 0, n + 1
@@ -574,7 +618,7 @@ class Session:
                     skipped[why] = skipped.get(why, 0) + 1
                     continue
                 padded[:CAP_H] = img
-                padded[CAP_H - MARK:CAP_H, :MARK_BLOCKS * MARK] = 0
+                hide_stamp(padded)
                 self.emit(padded, when)
                 last_pixels = padded.copy()
                 last_when = when

@@ -19,6 +19,8 @@ if [ -n "$pids" ]; then
     sleep 1
 fi
 rm -f sysdir/system.img
+# the framebuffer the streamer reads: a stale one (a killed emulator never removes it) can't be resized for a new panel
+python3 -c "import ctypes; ctypes.CDLL(None).shm_unlink(b'videmulator5554')"
 python3 "$H/build_super.py" $S/system.img sysdir/system.img system=work/system.img system_ext=work/system_ext.img product=work/product.img vendor=emu/emu_vendor.img >/dev/null
 python3 - <<'PY'
 import hashlib, os, struct, re
@@ -29,9 +31,10 @@ open(p + 'VerifiedBootParams.textproto', 'w').write(re.sub(r'digest=[0-9a-f]+', 
 PY
 export ANDROID_SDK_ROOT=~/Library/Android/sdk
 # AVD tuning: the address-space graphics transport (a ring buffer; the default pipe makes every Vulkan call a
-# blocking round trip), a 72 Hz display like the Quest's, and 6 vCPUs (Meta's runtime expects big cores 4+)
+# blocking round trip), a 72 Hz display like the Quest's, 6 vCPUs (Meta's runtime expects big cores 4+), and a
+# 2560x1600 panel: the stream's capture is drawn on it, 1280x1600 per eye (the shape of Horizon's eye images)
 AVD=~/.android/avd/horizon.avd/config.ini
-for kv in "hw.gltransport=asg" "hw.lcd.vsync=72" "hw.cpu.ncore=6"; do
+for kv in "hw.gltransport=asg" "hw.lcd.vsync=72" "hw.cpu.ncore=6" "hw.lcd.width=1600" "hw.lcd.height=2560"; do
     k=${kv%%=*}; v=${kv#*=}
     if grep -q "^$k" "$AVD"; then sed -i '' "s/^$k.*/$k = $v/" "$AVD"; else echo "$k = $v" >> "$AVD"; fi
 done

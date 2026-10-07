@@ -5,10 +5,10 @@ Q1 = {'device': 'Quest', 'eye_w': 1216, 'eye_h': 1344,
       'refresh_rates': [72], 'codecs': ['hevc', 'h264']}
 
 prof, config = st.negotiate(Q1)
-assert (prof['eye_w'], prof['eye_h']) == (960, 1088), prof
+assert (prof['eye_w'], prof['eye_h']) == (1280, 1600), prof
 assert (prof['fps'], prof['bitrate']) == (72, 20_000_000), prof
 # the encoded frame is exactly what CONFIG advertises (the decoder surface)
-assert (config['eye_w'], config['eye_h']) == (960, 1088), config
+assert (config['eye_w'], config['eye_h']) == (1280, 1600), config
 assert config['eye_w'] * 2 == prof['eye_w'] * 2, config
 assert config['fps'] == 72 and config['codec'] == 'h264', config
 assert len(config['fov']) == 2, config
@@ -16,8 +16,8 @@ assert len(config['fov']) == 2, config
 # unknown headsets echo their HELLO size, capped at 72 fps
 prof2, config2 = st.negotiate({'device': 'X', 'eye_w': 800,
                                'eye_h': 600, 'refresh_rates': [90]})
-assert (prof2['eye_w'], prof2['eye_h'], prof2['fps']) == (960, 1088, 72), prof2
-assert (config2['eye_w'], config2['eye_h']) == (960, 1088), config2
+assert (prof2['eye_w'], prof2['eye_h'], prof2['fps']) == (1280, 1600, 72), prof2
+assert (config2['eye_w'], config2['eye_h']) == (1280, 1600), config2
 
 # bad HELLO is rejected, never encoded
 for bad in ({'eye_w': 0, 'eye_h': 100},
@@ -82,8 +82,8 @@ def _recv_pkt(s):
 ptype, payload = _recv_pkt(b)
 assert ptype == 2, ptype
 config = json.loads(payload)
-assert (config['eye_w'], config['eye_h'], config['fps']) == (960, 1088, 72), config
-assert (sess.encoder.width, sess.encoder.height) == (1920, 1088)
+assert (config['eye_w'], config['eye_h'], config['fps']) == (1280, 1600, 72), config
+assert (sess.encoder.width, sess.encoder.height) == (2560, 1600)
 px = _np.zeros((st.ENC_H, st.CAP_W), _np.uint32)
 sess.emit(px, 123456)
 ptype, payload = _recv_pkt(b)

@@ -18,6 +18,7 @@
 #include <new>
 #include <thread>
 #include <unistd.h>
+#include <cutils/properties.h>
 #include <fmq/EventFlag.h>
 #include <fmq/MessageQueue.h>
 #include "touch_calibration.h"
@@ -231,12 +232,13 @@ struct ManagementClient : IControllerManagementClient {
 };
 
 // ---- controllers ----
-// Two Quest 2 Touch controllers, paired and connected, so Meta's controller manager registers them with tracking.
+// Two Quest 2 Touch controllers (type 1; measured by the model the runtime loads), paired and connected, so Meta's controller manager registers them with tracking.
 // Their poses and buttons come from the headset through TrackingDataInjection (input/Injector.java), not from here.
 static std::array<PairedControllerInfo, 2> touchControllers() {
     std::array<PairedControllerInfo, 2> c{};
     for (int i = 0; i < 2; i++) {
         PairedControllerInfo& p = c[i];
+        p.type() = property_get_int32("persist.emuxr2.controller_type", 1);   // 1 Quest 2 Touch, 0 Quest 1, 2 Touch Pro
         p.addr() = 0xC0FFEE00A000ull + i;   // 48-bit like a radio address: the injection service parses ids as signed
         p.connected() = 1;
         p.battery() = 100.f;
