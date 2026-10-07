@@ -1,0 +1,38 @@
+diff --git a/android/app/src/main/cpp/main.cpp b/android/app/src/main/cpp/main.cpp
+index 0a3cf36..5318a12 100644
+--- a/android/app/src/main/cpp/main.cpp
++++ b/android/app/src/main/cpp/main.cpp
+@@ -262,21 +262,30 @@ struct Client {
+             }
+             if(hasVideo && frame.predictedDisplayTime-rendered.displayTime>1000000000LL) hasVideo=false;
+             if(hasVideo) { videoAgeSum+=frame.predictedDisplayTime-rendered.displayTime; videoAgeCount++; }
++            // Network tracking may lead by the transport delay. The local reprojection
++            // target must instead describe this display frame, or the texture is warped
++            // into a future view and then warped back by the headset compositor.
++            std::array<XrView,2> displayViews{}; for(auto& view:displayViews) view.type=XR_TYPE_VIEW;
++            XrViewState displayState{XR_TYPE_VIEW_STATE}; uint32_t displayCount=0;
++            locate.displayTime=frame.predictedDisplayTime;
++            XrResult displayResult=xrLocateViews(session,&locate,&displayState,2,&displayCount,displayViews.data());
++            bool validDisplay=XR_SUCCEEDED(displayResult) && displayCount==2 &&
++                (displayState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)!=0;
+             std::array<XrCompositionLayerProjectionView,2> projectionViews{};
+-            bool submit=validViews && frame.shouldRender;
++            bool submit=validDisplay && frame.shouldRender;
+             if(submit) for(int eye=0;eye<2;eye++) {
+                 uint32_t index; XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO}; XR(xrAcquireSwapchainImage(chains[eye],&acquire,&index)); XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO}; wi.timeout=XR_INFINITE_DURATION; XR(xrWaitSwapchainImage(chains[eye],&wi));
+                 glBindFramebuffer(GL_FRAMEBUFFER,fbo); glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,images[eye][index].image,0); glViewport(0,0,sizes[eye].recommendedImageRectWidth,sizes[eye].recommendedImageRectHeight); glClearColor(0.02f,0.03f,0.06f,1); glClear(GL_COLOR_BUFFER_BIT);
+                 if(hasVideo) { glUseProgram(program);glBindVertexArray(vao);glActiveTexture(GL_TEXTURE0);glBindTexture(GL_TEXTURE_EXTERNAL_OES,texture);glUniform1i(glGetUniformLocation(program,"video"),0);glUniform1f(glGetUniformLocation(program,"eye"),(float)eye);glUniformMatrix4fv(glGetUniformLocation(program,"transform"),1,GL_FALSE,transform.data());
+                     XrFovf in=rendered.views[eye].fov; { std::lock_guard<std::mutex> lock(fovMutex); if(videoFovSet) in=videoFov[eye]; }
+-                    const XrFovf& out=snapshot.views[eye].fov; std::array<float,9> d=relative(rendered.views[eye].pose.orientation,snapshot.views[eye].pose.orientation);
++                    const XrFovf& out=displayViews[eye].fov; std::array<float,9> d=relative(rendered.views[eye].pose.orientation,displayViews[eye].pose.orientation);
+                     glUniformMatrix3fv(glGetUniformLocation(program,"delta"),1,GL_FALSE,d.data());
+                     glUniform4f(glGetUniformLocation(program,"viewTan"),tanf(out.angleLeft),tanf(out.angleRight),tanf(out.angleDown),tanf(out.angleUp));
+                     glUniform4f(glGetUniformLocation(program,"videoTan"),tanf(in.angleLeft),tanf(in.angleRight),tanf(in.angleDown),tanf(in.angleUp));
+                     glUniform2f(glGetUniformLocation(program,"inset"),0.002f,0.002f);   // keeps bilinear taps off the other eye
+                     glDrawArrays(GL_TRIANGLES,0,3); }
+                 glFlush(); XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO}; XR(xrReleaseSwapchainImage(chains[eye],&releaseInfo));
+-                auto& pv=projectionViews[eye];pv.type=XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;pv.pose=snapshot.views[eye].pose; if(hasVideo) pv.pose.position=rendered.views[eye].pose.position; pv.fov=snapshot.views[eye].fov;pv.subImage.swapchain=chains[eye];pv.subImage.imageRect.extent={(int32_t)sizes[eye].recommendedImageRectWidth,(int32_t)sizes[eye].recommendedImageRectHeight};
++                auto& pv=projectionViews[eye];pv.type=XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;pv.pose=displayViews[eye].pose; if(hasVideo) pv.pose.position=rendered.views[eye].pose.position; pv.fov=displayViews[eye].fov;pv.subImage.swapchain=chains[eye];pv.subImage.imageRect.extent={(int32_t)sizes[eye].recommendedImageRectWidth,(int32_t)sizes[eye].recommendedImageRectHeight};
+             }
+             XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};layer.space=space;layer.viewCount=2;layer.views=projectionViews.data(); const XrCompositionLayerBaseHeader* layers[]={reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer)};
+             XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};end.displayTime=frame.predictedDisplayTime;end.environmentBlendMode=XR_ENVIRONMENT_BLEND_MODE_OPAQUE;end.layerCount=submit?1:0;end.layers=submit?layers:nullptr; XR(xrEndFrame(session,&end));

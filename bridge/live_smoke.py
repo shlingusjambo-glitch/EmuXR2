@@ -35,7 +35,7 @@ def receive(s):
     return kind, exact(s, length)
 
 
-def tracking(timestamp, elapsed, controllers):
+def tracking(timestamp, elapsed, controllers, menu=False):
     q = (0, math.sin(.1 * math.sin(elapsed)), 0, math.cos(.1 * math.sin(elapsed)))
     pose = lambda x, y, z: struct.pack('<7f', x, y, z, *q)
     payload = struct.pack('<Q', timestamp) + pose(0, 1.6, 0)
@@ -43,7 +43,7 @@ def tracking(timestamp, elapsed, controllers):
         payload += pose(x, 1.6, 0) + struct.pack('<4f', -.8, .8, .8, -.8)
     for h in range(2):
         trigger = .85 if int(elapsed * 2) % 2 else 0
-        buttons = 16 if h == 0 and .5 < elapsed < .6 else 0
+        buttons = 16 if menu and h == 0 and .5 < elapsed < .6 else 0
         handpose = pose((-.25, .25)[h], 1.25, -.5)
         payload += struct.pack('<II', 3 if controllers else 0, buttons) + handpose * 2
         payload += struct.pack('<4f', trigger, .2, .25 * math.sin(elapsed), .25 * math.cos(elapsed))
@@ -55,6 +55,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--seconds', type=float, default=15)
     parser.add_argument('--controllers', action='store_true')
+    parser.add_argument('--menu', action='store_true', help='Exercise the left menu button; leaves the running VR game')
     parser.add_argument('--tracking-hz', type=float, default=72)
     parser.add_argument('--max-p95-ms', type=float, default=500)
     parser.add_argument('--eye-w', type=int, default=1216)
@@ -80,7 +81,7 @@ def main():
                 while not stop.is_set():
                     timestamp = time.monotonic_ns()
                     sent.add(timestamp)
-                    send(s, 3, tracking(timestamp, time.monotonic() - start, args.controllers))
+                    send(s, 3, tracking(timestamp, time.monotonic() - start, args.controllers, args.menu))
                     stop.wait(1/args.tracking_hz)
             except OSError as e:
                 if not stop.is_set():

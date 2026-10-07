@@ -428,15 +428,32 @@ class Session:
                 self.encoder.close()
             except Exception:
                 pass
-        # Software zerolatency encoding is faster here than low-delay VideoToolbox and avoids decoder buffering.
-        c = av.CodecContext.create('libx264', 'w')
-        c.width, c.height, c.pix_fmt = prof['eye_w'] * 2, prof['eye_h'], 'yuv420p'
-        c.time_base, c.framerate = Fraction(1, 1_000_000), Fraction(prof['fps'], 1)
-        c.bit_rate, c.gop_size, c.max_b_frames = prof['bitrate'], 10 * prof['fps'], 0
-        kbps = prof['bitrate'] // 1000
-        c.options = {'preset': 'ultrafast', 'tune': 'zerolatency',
-                     'x264-params': f'vbv-maxrate={kbps}:vbv-bufsize={kbps // prof["fps"] * 2}:repeat-headers=1'}
-        c.open()
+        # macOS hardware encoding frees CPU for the guest. Baseline, one reference
+        # and LOW_DELAY are required together to avoid holding multiple input frames.
+        requested = os.getenv('EMUXR2_ENCODER', 'auto')
+        hardware = sys.platform == 'darwin' and requested != 'software'
+        def encoder(hardware):
+            c = av.CodecContext.create('h264_videotoolbox' if hardware else 'libx264', 'w')
+            c.width, c.height, c.pix_fmt = prof['eye_w'] * 2, prof['eye_h'], 'nv12' if hardware else 'yuv420p'
+            c.time_base, c.framerate = Fraction(1, 1_000_000), Fraction(prof['fps'], 1)
+            c.bit_rate, c.gop_size, c.max_b_frames = prof['bitrate'], 10 * prof['fps'], 0
+            if hardware:
+                c.flags |= av.codec.context.Flags.low_delay
+                c.options = {'realtime': '1', 'prio_speed': '1', 'power_efficient': '0',
+                             'allow_sw': '0', 'profile': 'baseline', 'max_ref_frames': '1'}
+            else:
+                kbps = prof['bitrate'] // 1000
+                c.options = {'preset': 'ultrafast', 'tune': 'zerolatency',
+                             'x264-params': f'vbv-maxrate={kbps}:vbv-bufsize={kbps // prof["fps"] * 2}:repeat-headers=1'}
+            c.open()
+            return c
+        try:
+            c = encoder(hardware)
+        except (av.error.FFmpegError, ValueError) as error:
+            if not hardware: raise
+            log('hardware encoder unavailable; using software:', error)
+            c = encoder(False)
+        log('encoder:', c.name)
         self.encoder_times.clear()
         self.encoder = c
         self.prof = prof

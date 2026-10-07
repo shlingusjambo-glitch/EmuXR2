@@ -3,6 +3,8 @@
 // node: macvr-hal.rc mounts a tmpfs over /sys/class/drm with that file, and this thread keeps it current at the
 // composer's refresh rate.
 #include <fcntl.h>
+#include <errno.h>
+#include "vsync_schedule.h"
 #include <stdio.h>
 #include <string.h>
 #include <thread>
@@ -19,7 +21,15 @@ void registerVsync() {
             int64_t period = 1000000000LL / (composerRate() > 0 ? composerRate() : 72);
             int64_t ns = t.tv_sec * 1000000000LL + t.tv_nsec + period;
             t.tv_sec = ns / 1000000000LL; t.tv_nsec = ns % 1000000000LL;
-            clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &t, nullptr);
+            int status;
+            do { status=clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &t, nullptr); } while (status==EINTR);
+            if (status) { ALOGE("vsync sleep failed: %s", strerror(status)); continue; }
+            timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+            ns=latestVsync(ns,now.tv_sec*1000000000LL+now.tv_nsec,period);
+            if (!ns) continue;
+            // Skip missed periods, keeping the original phase. Catch-up writes make
+            // Meta briefly see old display times and repeatedly miss retirement deadlines.
+            t.tv_sec=ns/1000000000LL;t.tv_nsec=ns%1000000000LL;
             // fixed width (space padded: the reader's strtoll uses base 0, so no leading zeros)
             char s[40]; int n = snprintf(s, sizeof s, "VSYNC=%20lld\n", (long long)ns);
             pwrite(fd, s, n, 0);

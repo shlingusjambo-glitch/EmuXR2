@@ -95,7 +95,10 @@ retains its captured pose timestamp, even on keep-alive repeats.
 
 The macOS capture path uses Accelerate to rotate the portrait framebuffer without
 changing its pixel bytes, then reuses the video converter and avoids extra full-frame
-copies. Other hosts use the NumPy rotation fallback. `EMUXR2_PROFILE=1 ./start-streamer.sh`
+copies. On macOS, VideoToolbox uses baseline H.264, a single reference frame and
+low-delay mode so every input produces a packet immediately while freeing CPU for
+the guest. Hardware initialization failures fall back to software; set
+`EMUXR2_ENCODER=software` to compare. Other hosts use software encoding and the NumPy rotation fallback. `EMUXR2_PROFILE=1 ./start-streamer.sh`
 reports conversion/encoding/send times and head/eye pose agreement. The compositor's
 window buffer need not be preserved because its persistent front texture is copied
 in full at each presentation; `debug.macvr.preserve_window=1` restores preservation
@@ -140,3 +143,9 @@ Launch an already installed VR app directly with `./launch.sh app <package>`.
 For example, `./launch.sh app com.AnotherAxiom.GorillaTag` resolves its installed
 MAIN activity. Native local-account Library currently lists its supported local
 apps; it does not expose every sideloaded game in that mode.
+
+The headset client must reproject decoded frames to the current OpenXR display
+pose, rather than the future pose used for network tracking. The corresponding
+VR4Mac client source change is saved in `bridge/client-display-time.patch`; apply
+it from the sibling VR4Mac checkout with `git apply EmuXR2/bridge/client-display-time.patch`,
+then rebuild and install its Android APK. Already-applied patches need no reapplication.

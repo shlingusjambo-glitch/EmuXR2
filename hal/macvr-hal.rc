@@ -1,5 +1,6 @@
 service macvr-hal /vendor/bin/hw/macvr-hal
     class hal
+    priority -8
     user system
     group system
     seclabel u:r:hal_graphics_composer_default:s0
