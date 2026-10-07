@@ -105,8 +105,9 @@ More detail on controls, streaming options and diagnostics is in [docs/streaming
 
 ## Legal
 
-EmuXR2 is an independent project, not affiliated with or endorsed by Meta. It contains no Meta software,
-firmware or assets; it patches a firmware image you supply, on your own machine.
+EmuXR2 is not affiliated with Meta Platforms, Inc., is not a Meta product, and is not endorsed or otherwise
+sponsored by Meta. Portions of the materials shown here, such as screenshots of Horizon OS, are property of
+Meta Platforms, Inc. Meta, Meta Quest and Horizon OS are trademarks of Meta Platforms, Inc.
 
 ## License
 
