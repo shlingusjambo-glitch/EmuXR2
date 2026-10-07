@@ -392,3 +392,29 @@ All currently actionable code/build/deployment and regression checks are complet
   trips (buffer acquire, sync creation); typical stream 30-47 unique fps, pose age ~80-110 ms.
 - Meta account: blocked. Meta's servers authenticate the headset with its factory device identity certificate
   ("Unable to load insecure device identity certificate"), which an emulator has no genuine copy of.
+
+### Quest 2: true scale, sharper, no black edges, Quest 2 controllers, Unknown Sources (2026-10-06, night)
+
+- Zoomed-in view: the Quest 2 ran the Oct 3 client, which ignores CONFIG "fov" and stretched the 80-degree capture over
+  the headset's whole view (and slid it while turning). The client now advertises `features: ["fov"]`; the streamer
+  installs this repository's client over USB on a headset without it.
+- Black edges: the capture's field of view is 80 degrees plus the request's `video_capture_aspect_ratio_fov`
+  (libvrruntimeservice: 80 - stabil crop + adjustment). 9.4 more reaches the edge of Horizon's eye images (wider is
+  black inside the capture). The client re-aims each eye from the frame's pose to the current one and stretches edge
+  pixels when a turn outruns the frame, instead of showing black.
+- Resolution: 2560x1600 panel, capture 1280x1600 per eye (the eye images' shape), Horizon's default eye buffers,
+  40 Mbps. Re-measured with `bridge/calibrate_capture.py`: f 662.7 px, centre 674.3/616.6, 776.8.
+- `bridge/motion_check.py` turns the head at up to 90 deg/s and checks each captured frame against its pose number:
+  UI mean 0.3-0.4 deg off; ~8 % of frames lead their stamp by ~30 ms (Horizon extrapolates the injected pose).
+- Controllers: PairedControllerInfo's first word is the controller type; 1 makes the runtime load "Oculus Touch
+  Quest 2" (0 was Quest 1, 2 Touch Pro, 4 placeholders). `persist.emuxr2.controller_type` overrides.
+- Black blocks in panels: HWUI partial redraws (buffer age) on a swapchain that doesn't keep old pixels; whole-frame
+  redraws via `debug.hwui.use_buffer_age=false`, `debug.hwui.use_partial_updates=false`.
+- Emulator crash (`unallocate: freeSubblocks.insert`) after a runtime restart: the restarted runtime served panels
+  65536x65536 swapchain placeholders before the EGL shim's clamp was hooked; it now hooks at the first context.
+- Unknown Sources: SystemUX lists every non-library, non-system app, but first asks OCMS for the library, which threw
+  "Invalid credentials or user id" without an account, so the list was always empty. Meta's kiosk mode
+  (`q4b_kiosk_enabled`) gives OCMS a local "kiosk_user"; `bridge/unknown_sources.py` (run at stream start) turns it
+  on and files the environments under Environments. Gorilla Tag now lists.
+- Login: the browser opens without one. Store, TV, Chats, People, Explore show errors or loading screens because they
+  are Meta's online services and need a Meta account; see the device certificate note above.
