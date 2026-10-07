@@ -497,3 +497,10 @@ All currently actionable code/build/deployment and regression checks are complet
 - Ape Sprint (VrApi median): 25 fps windowed -> 30 headless -> 41-55 with Vulkan composition (scene dependent), capture 58 fps alongside. Gorilla Tag: 72/72, vsync-locked. Home 72.
 - Rejected (measured): AsyncComposeSupport and no GL pipe checksums (no change), VulkanBatchedDescriptorSetUpdate (guest renders black), polling fence waits (worse: raw Vulkan fence p90 0.98 ms waiting vs 7.5 ms polling), ANGLE asyncCommandQueue off (27 vs 30 fps), MoltenVK asynchronous submits (no change), KosmicKrisp ICD (emulator aborts on a Metal texture-view assertion).
 - Ape Sprint from Downloads (v7) lacks Unity's XR natives (libOculusXRPlugin, libOVRPlugin, libopenxr_loader) and runs flat; the complete v6 from the user's Quest runs in VR, online (Photon/PlayFab) per the user.
+
+### Streaming link and panel stability (2026-10-07)
+
+- Every streamer start (and every reconnect that re-ran the guest setup) force-stopped SystemUX through unknown_sources.py, closing all open panels. The Library setup is now idempotent: when kiosk mode is on and the local library already lists the installed environments, it leaves OCMS and SystemUX running.
+- gRPC capture: the streamer's adb subprocesses made gRPC log fork warnings every two seconds; fork support and info logging are off. EMUXR2_NO_HEADSET=1 ignores a connected Quest so bridge/live_smoke.py can measure the stream.
+- Encoder ceiling measured on real Ape Sprint frames: VideoToolbox H.264/HEVC at 2560x1600 sustains ~31 fps (2048x1280: 44, 1920x1200: 51), independent of emulator load (32 fps with the emulator paused), queued or per-eye-parallel (35). x264 ultrafast streams 45-55 fps but takes P-core time from the guest (Ape Sprint 45 -> 24; utility QoS 28; background QoS 36 with a 17 fps stream). Hardware encoding stays the default; moving game content streams near 30 fps and the headset re-aims each frame to the current head pose.
+- Ape Sprint renders without MSAA (all attachments single-sampled), so multisample cost is not the GPU load.

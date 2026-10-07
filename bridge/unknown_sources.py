@@ -37,10 +37,30 @@ def environment_row(pkg):
     }
 
 
+def listed(local):
+    """(package, version code) pairs the local library already holds for the kiosk user."""
+    db = sqlite3.connect(local)
+    try:
+        return set(db.execute('select item_id, latest_version_code from library where user_id = ?', (USER,)))
+    except sqlite3.Error:
+        return None
+    finally:
+        db.close()
+
+
 def main():
-    shell('oculuspreferences --setc q4b_kiosk_enabled true')
+    kiosk = 'true' in shell('oculuspreferences --getc q4b_kiosk_enabled')
     envs = [l.split(':', 1)[1].strip() for l in shell('pm list packages -3').splitlines()
             if l.startswith('package:') and l.split(':', 1)[1].strip().startswith(ENVIRONMENTS)]
+    rows = {pkg: environment_row(pkg) for pkg in envs}
+    with tempfile.TemporaryDirectory() as d:
+        local = os.path.join(d, 'library_database')
+        subprocess.run(ADB + ['shell', f'cat {DB}'], stdout=open(local, 'wb'), timeout=60)
+        # Already set up: leave OCMS and SystemUX running (restarting SystemUX closes every open panel)
+        if kiosk and listed(local) == {(p, r['latest_version_code']) for p, r in rows.items()}:
+            print('local library: up to date; sideloaded apps list under Unknown Sources')
+            return
+    shell('oculuspreferences --setc q4b_kiosk_enabled true')
     shell('am force-stop com.oculus.ocms')
     with tempfile.TemporaryDirectory() as d:
         local = os.path.join(d, 'library_database')
@@ -50,7 +70,7 @@ def main():
         blank = {c: '' if t == 'TEXT' else 0 for _, c, t, *_ in db.execute('pragma table_info(library)')}
         db.execute('delete from library where user_id = ?', (USER,))
         for pkg in envs:
-            r = dict(blank, **environment_row(pkg))
+            r = dict(blank, **rows[pkg])
             db.execute(f'insert into library ({", ".join(r)}) values ({", ".join("?" * len(r))})', list(r.values()))
         db.commit()
         db.close()

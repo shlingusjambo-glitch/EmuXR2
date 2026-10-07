@@ -76,6 +76,8 @@ def adb(*args, serial=EMU, timeout=20):
 
 
 def quest_serial():
+    if os.environ.get('EMUXR2_NO_HEADSET') == '1':   # local test clients only (bridge/live_smoke.py)
+        return None
     for line in subprocess.run([ADB, 'devices'], capture_output=True, text=True).stdout.splitlines()[1:]:
         f = line.split()
         if len(f) == 2 and f[1] == 'device' and not f[0].startswith('emulator-'):
@@ -233,6 +235,9 @@ class GrpcDisplay(ShmDisplay):
 
     def __init__(self, port, token=None):
         sys.path.insert(0, os.path.join(OUT, 'grpc'))
+        # the streamer runs adb as subprocesses all along: gRPC's fork handlers only log about it
+        os.environ.setdefault('GRPC_ENABLE_FORK_SUPPORT', 'false')
+        os.environ.setdefault('GRPC_VERBOSITY', 'ERROR')
         import grpc
         try:
             import emulator_controller_pb2 as pb, emulator_controller_pb2_grpc as rpc
