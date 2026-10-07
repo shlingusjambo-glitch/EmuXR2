@@ -48,6 +48,8 @@ x work/system.img /system/build.prop work/sbuild.prop
 FP=$(sed -n 's/^ro.system.build.fingerprint=//p' work/sbuild.prop)
 sed -i '' "s|^ro.vendor.build.fingerprint=.*|ro.vendor.build.fingerprint=$FP|" work/vbuild.prop
 put emu/emu_vendor.img work/vbuild.prop /build.prop
+python3 "$H/bridge/flat_mesh.py" work/emuxr2-mesh.bin
+put emu/emu_vendor.img work/emuxr2-mesh.bin /etc/emuxr2-mesh.bin u:object_r:vendor_configs_file:s0
 # AOSP binaries taken from the emulator's own system partition (extracted once, cached in aosp/)
 AOSP="bin/mediaserver bin/drmserver lib64/libmediaplayerservice.so lib64/libresourcemanagerservice.so lib64/libstagefright_httplive.so"
 for f in $AOSP; do [ -f aosp/$(basename $f) ] || NEED=1; done

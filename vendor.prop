@@ -9,3 +9,6 @@ debug.angle.feature_overrides_enabled=asyncCommandQueue
 # (buffer age) left everything outside the changed region black in Horizon's panels
 debug.hwui.use_buffer_age=false
 debug.hwui.use_partial_updates=false
+# the compositor draws plain perspective eye images (no lens warp) for the stream: our flat mesh, from bridge/flat_mesh.py.
+# Set here so the runtime has it from boot: restarting the runtime to load it orphans VrShell's overlay (no reconnect)
+debug.oculus.distortionFileName=/vendor/etc/emuxr2-mesh.bin

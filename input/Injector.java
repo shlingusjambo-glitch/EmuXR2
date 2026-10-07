@@ -115,7 +115,7 @@ public class Injector {
     static final HomeButton menuButton = new HomeButton();
     static final AtomicBoolean homePending = new AtomicBoolean();
     static void desktopHome() {
-        if ("0".equals(SystemProperties.get("persist.emuxr2.home_fallback", "1")) ||
+        if (!"1".equals(SystemProperties.get("persist.emuxr2.home_fallback", "0")) ||
                 !homePending.compareAndSet(false, true)) return;
         Thread worker = new Thread(() -> {
             try {

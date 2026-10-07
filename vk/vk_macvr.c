@@ -575,8 +575,10 @@ static VkResult AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *ai, con
         if (!s) return r;
         s->mem = *out; s->exporter = 1;
         if (!s->complex) { s->ready = 1; return r; }
-        // shadows to share, and the generation counter
-        s->n = s->ci.arrayLayers * s->ci.mipLevels;
+        // shadows to share, and the generation counter. Depth isn't shared: the emulator has no depth Android buffers,
+        // and the compositor needs only the colour (depth would feed optional depth reprojection). Each process keeps
+        // its own depth image, so swapchains with depth (VrShell's overlay: the in-game menu) still get created.
+        s->n = formatAspect(s->ci.format) == VK_IMAGE_ASPECT_COLOR_BIT ? s->ci.arrayLayers * s->ci.mipLevels : 0;
         s->genFd = memfd_create("macvr-gen", MFD_CLOEXEC);
         ftruncate(s->genFd, 4096);
         s->gen = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, s->genFd, 0);

@@ -109,10 +109,17 @@ def prepare_library():
 def restart_runtime():
     """Restart Meta's VR runtime (its compositor); VrShell and ShellEnv come back with it in ~20 s."""
     adb('shell', 'kill $(pidof com.oculus.vrruntimeservice)')
+    # VrShell's overlay (the in-game universal menu) doesn't reconnect to a new runtime: respawn it once that is up
+    threading.Timer(25, adb, ('shell', 'kill $(pidof com.oculus.vrshell:Overlay)')).start()
 
 
 def flat_display():
-    """Make sure the compositor draws plain eye images (the flat mesh); restarts the runtime when it had another."""
+    """Make sure the compositor draws plain eye images (the flat mesh); restarts the runtime when it had another.
+
+    Images built by patch.sh carry the mesh and its property (vendor.prop), so the runtime has it from boot: a runtime
+    restart orphans VrShell's overlay (the in-game universal menu), which doesn't reconnect."""
+    if adb('shell', 'getprop debug.oculus.distortionFileName').stdout.strip() == '/vendor/etc/emuxr2-mesh.bin':
+        return
     with open(os.path.join(OUT, 'emuxr2-mesh.bin'), 'wb') as f:
         f.write(flat_mesh.mesh(EYE_FOV))
     adb('push', os.path.join(OUT, 'emuxr2-mesh.bin'), MESH)

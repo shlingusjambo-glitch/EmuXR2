@@ -514,6 +514,23 @@ __attribute__((visibility("default"))) void macvr_TextureView(GLuint view, GLenu
         LOG("glTextureViewOES(view %u target 0x%x orig %u fmt 0x%x level %u+%u layer %u+%u): unsupported%s", view, target, orig, fmt,
             minlevel, numlevels, minlayer, numlayers, buf ? "" : " (no shared buffer)");
         if (buf) AHardwareBuffer_release(buf);
+        // Depth swapchains stay local to each process (vk_macvr.c shares no depth): give a depth layer's view its own
+        // storage so the app can still depth-test into it (VrShell's overlay, the in-game menu, does).
+        int depth = fmt == GL_DEPTH_COMPONENT16 || fmt == GL_DEPTH_COMPONENT24 || fmt == GL_DEPTH_COMPONENT32F ||
+                    fmt == GL_DEPTH24_STENCIL8 || fmt == GL_DEPTH32F_STENCIL8;
+        if (!buf && depth && numlayers == 1 && numlevels == 1 && target == GL_TEXTURE_2D) {
+            GLint w = 0, h = 0, prevArr = boundTex(GL_TEXTURE_2D_ARRAY), prev2d = boundTex(GL_TEXTURE_2D);
+            ((void (*)(GLenum, GLuint))gl("glBindTexture"))(GL_TEXTURE_2D_ARRAY, orig);
+            ((void (*)(GLenum, GLint, GLenum, GLint *))gl("glGetTexLevelParameteriv"))(GL_TEXTURE_2D_ARRAY, minlevel, GL_TEXTURE_WIDTH, &w);
+            ((void (*)(GLenum, GLint, GLenum, GLint *))gl("glGetTexLevelParameteriv"))(GL_TEXTURE_2D_ARRAY, minlevel, GL_TEXTURE_HEIGHT, &h);
+            ((void (*)(GLenum, GLuint))gl("glBindTexture"))(GL_TEXTURE_2D_ARRAY, prevArr);
+            if (w && h) {
+                ((void (*)(GLenum, GLuint))gl("glBindTexture"))(GL_TEXTURE_2D, view);
+                ((void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei))gl("glTexStorage2D"))(GL_TEXTURE_2D, 1, fmt, w, h);
+                ((void (*)(GLenum, GLuint))gl("glBindTexture"))(GL_TEXTURE_2D, prev2d);
+                LOG("texture view %u: local %dx%d depth layer", view, w, h);
+            }
+        }
         return;
     }
     EGLDisplay dpy = ((EGLDisplay (*)(void))real("eglGetCurrentDisplay"))();

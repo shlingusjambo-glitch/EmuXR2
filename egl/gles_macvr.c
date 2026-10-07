@@ -354,7 +354,13 @@ void glBindFramebuffer(GLenum target, GLuint fb) {
 ATTACH(glFramebufferTexture2D, (GLenum t, GLenum a, GLenum tt, GLuint tex, GLint l), (t, a, tt, tex, l), tex, "(0x%x, 0x%x, tex %u)", a, tt, tex)
 ATTACH(glFramebufferTextureLayer, (GLenum t, GLenum a, GLuint tex, GLint l, GLint layer), (t, a, tex, l, layer), tex, "(0x%x, tex %u, layer %d)", a, tex, layer)
 ATTACH(glFramebufferTextureMultiviewOVR, (GLenum t, GLenum a, GLuint tex, GLint l, GLint base, GLsizei n), (t, a, tex, l, base, n), tex, "(0x%x, tex %u, views %d+%d)", a, tex, base, n)
-ATTACH(glFramebufferTextureMultisampleMultiviewOVR, (GLenum t, GLenum a, GLuint tex, GLint l, GLsizei s, GLint base, GLsizei n), (t, a, tex, l, s, base, n), tex, "(0x%x, tex %u, views %d+%d)", a, tex, base, n)
+// ANGLE has multiview but not its multisampled form (VrShell's overlay, the in-game menu, uses it): draw unsampled
+void glFramebufferTextureMultisampleMultiviewOVR(GLenum t, GLenum a, GLuint tex, GLint l, GLsizei s, GLint base, GLsizei n) {
+    static void (*f)(GLenum, GLenum, GLuint, GLint, GLsizei, GLint, GLsizei); static int tried;
+    if (!tried) { f = dlsym(RTLD_NEXT, "glFramebufferTextureMultisampleMultiviewOVR"); tried = 1; }
+    if (f) { noteAttach(tex); rememberAttach(t, a, tex); f(t, a, tex, l, s, base, n); }
+    else glFramebufferTextureMultiviewOVR(t, a, tex, l, base, n);
+}
 // a front buffer keeps its pixels: the compositor's invalidations of framebuffer 0 (meant for a tiler's window) are
 // dropped there, as their default-framebuffer attachment names don't apply to a texture
 static int frontBound(GLenum target) {
