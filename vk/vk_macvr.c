@@ -23,6 +23,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/system_properties.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -48,7 +50,7 @@ typedef struct {
     FN(GetMemoryAndroidHardwareBufferANDROID); FN(GetAndroidHardwareBufferPropertiesANDROID);
     FN(CreateCommandPool); FN(AllocateCommandBuffers); FN(FreeCommandBuffers); FN(BeginCommandBuffer); FN(EndCommandBuffer);
     FN(CmdPipelineBarrier); FN(CmdCopyImage); FN(QueueSubmit); FN(QueueSubmit2); FN(QueueSubmit2KHR); FN(GetDeviceQueue); FN(GetDeviceQueue2);
-    FN(CreateFence); FN(DestroyFence); FN(WaitForFences);
+    FN(CreateFence); FN(DestroyFence); FN(WaitForFences); FN(GetFenceStatus); FN(WaitSemaphores); FN(WaitSemaphoresKHR); FN(GetSemaphoreCounterValue); FN(GetSemaphoreCounterValueKHR);
     FN(CreateImageView); FN(DestroyImageView); FN(CreateFramebuffer); FN(DestroyFramebuffer);
     FN(CmdBeginRenderPass); FN(CmdBeginRenderPass2); FN(CmdBeginRenderPass2KHR);
     FN(CmdClearColorImage); FN(CmdBeginRendering); FN(CmdBeginRenderingKHR); FN(CmdPipelineBarrier2); FN(CmdPipelineBarrier2KHR); FN(CmdExecuteCommands); FN(CmdDraw); FN(CmdDrawIndexed); FN(CmdCopyImage2); FN(CmdBlitImage2); FN(CmdResolveImage2); FN(CmdCopyBufferToImage2); FN(CmdCopyImage2KHR); FN(CmdBlitImage2KHR); FN(CmdResolveImage2KHR); FN(CmdCopyBufferToImage2KHR); FN(CreateRenderPass); FN(CreateRenderPass2); FN(CmdNextSubpass); FN(CmdEndRenderPass); FN(CmdBlitImage); FN(CmdCopyBufferToImage); FN(CmdResolveImage);
@@ -340,7 +342,7 @@ static VkResult CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, 
         GET(GetMemoryAndroidHardwareBufferANDROID); GET(GetAndroidHardwareBufferPropertiesANDROID);
         GET(CreateCommandPool); GET(AllocateCommandBuffers); GET(FreeCommandBuffers); GET(BeginCommandBuffer); GET(EndCommandBuffer);
         GET(CmdPipelineBarrier); GET(CmdCopyImage); GET(QueueSubmit); GET(QueueSubmit2); GET(QueueSubmit2KHR); GET(GetDeviceQueue); GET(GetDeviceQueue2);
-        GET(CreateFence); GET(DestroyFence); GET(WaitForFences);
+        GET(CreateFence); GET(DestroyFence); GET(WaitForFences); GET(GetFenceStatus); GET(WaitSemaphores); GET(WaitSemaphoresKHR); GET(GetSemaphoreCounterValue); GET(GetSemaphoreCounterValueKHR);
         GET(CreateImageView); GET(DestroyImageView); GET(CreateFramebuffer); GET(DestroyFramebuffer);
         GET(CmdBeginRenderPass); GET(CmdBeginRenderPass2); GET(CmdBeginRenderPass2KHR);
         GET(CmdClearColorImage); GET(CmdBeginRendering); GET(CmdBeginRenderingKHR); GET(CmdPipelineBarrier2); GET(CmdPipelineBarrier2KHR); GET(CmdExecuteCommands); GET(CmdDraw); GET(CmdDrawIndexed); GET(CmdCopyImage2); GET(CmdBlitImage2); GET(CmdResolveImage2); GET(CmdCopyBufferToImage2); GET(CmdCopyImage2KHR); GET(CmdBlitImage2KHR); GET(CmdResolveImage2KHR); GET(CmdCopyBufferToImage2KHR); GET(CreateRenderPass); GET(CreateRenderPass2); GET(CmdNextSubpass); GET(CmdEndRenderPass); GET(CmdBlitImage); GET(CmdCopyBufferToImage); GET(CmdResolveImage);
@@ -1098,11 +1100,60 @@ static VkResult QueueSubmit2(VkQueue queue, uint32_t count, const VkSubmitInfo2 
 }
 
 // ---- dispatch ----
+// Waits never block the host (debug.macvr.pollwaits=0 restores blocking ones): a host-side wait holds that guest thread's whole stream
+// (it spins on the ring meanwhile), and one whose signaller died never returns. The guest asks for the status and
+// sleeps between asks, 0.1 ms doubling to 0.5 ms.
+static int pollWaits(void) {
+    static int v = -1;
+    if (v < 0) { char p[PROP_VALUE_MAX] = ""; __system_property_get("debug.macvr.pollwaits", p); v = strcmp(p, "0") != 0; }
+    return v;
+}
+static uint64_t monoNs(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec; }
+static VkResult WaitForFences(VkDevice dev, uint32_t n, const VkFence *f, VkBool32 all, uint64_t timeout) {
+    Dev *d = findDev(dev);
+    if (!pollWaits() || !d->GetFenceStatus) return d->WaitForFences(dev, n, f, all, timeout);
+    uint64_t start = monoNs(); useconds_t nap = 100;
+    for (;;) {
+        uint32_t done = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            VkResult r = d->GetFenceStatus(dev, f[i]);
+            if (r == VK_SUCCESS) done++; else if (r != VK_NOT_READY) return r;
+        }
+        if (all ? done == n : done > 0) return VK_SUCCESS;
+        if (!timeout || monoNs() - start >= timeout) return VK_TIMEOUT;
+        usleep(nap); if (nap < 500) nap *= 2;
+    }
+}
+static VkResult waitSemaphores(Dev *d, PFN_vkWaitSemaphores wait, PFN_vkGetSemaphoreCounterValue value, VkDevice dev,
+                               const VkSemaphoreWaitInfo *info, uint64_t timeout) {
+    if (!pollWaits() || !value) return wait(dev, info, timeout);
+    int any = info->flags & VK_SEMAPHORE_WAIT_ANY_BIT;
+    uint64_t start = monoNs(); useconds_t nap = 100;
+    for (;;) {
+        uint32_t done = 0;
+        for (uint32_t i = 0; i < info->semaphoreCount; i++) {
+            uint64_t v = 0; VkResult r = value(dev, info->pSemaphores[i], &v);
+            if (r) return r;
+            if (v >= info->pValues[i]) done++;
+        }
+        if (any ? done > 0 : done == info->semaphoreCount) return VK_SUCCESS;
+        if (!timeout || monoNs() - start >= timeout) return VK_TIMEOUT;
+        usleep(nap); if (nap < 500) nap *= 2;
+    }
+}
+static VkResult WaitSemaphores(VkDevice dev, const VkSemaphoreWaitInfo *info, uint64_t timeout) {
+    Dev *d = findDev(dev); return waitSemaphores(d, d->WaitSemaphores, d->GetSemaphoreCounterValue, dev, info, timeout);
+}
+static VkResult WaitSemaphoresKHR(VkDevice dev, const VkSemaphoreWaitInfo *info, uint64_t timeout) {
+    Dev *d = findDev(dev); return waitSemaphores(d, d->WaitSemaphoresKHR, d->GetSemaphoreCounterValueKHR, dev, info, timeout);
+}
 static PFN_vkVoidFunction GetDeviceProcAddr(VkDevice dev, const char *n);
 #define HOOK(name, fn) if (!strcmp(n, name)) return (PFN_vkVoidFunction)fn
 static PFN_vkVoidFunction deviceHook(const char *n) {
     HOOK("vkGetDeviceProcAddr", GetDeviceProcAddr);
     HOOK("vkDestroyDevice", DestroyDevice);
+    HOOK("vkWaitForFences", WaitForFences);
+    HOOK("vkWaitSemaphores", WaitSemaphores); HOOK("vkWaitSemaphoresKHR", WaitSemaphoresKHR);
     HOOK("vkCreateImage", CreateImage);
     HOOK("vkDestroyImage", DestroyImage);
     HOOK("vkCreateBuffer", CreateBuffer);
