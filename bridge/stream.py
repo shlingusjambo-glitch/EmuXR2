@@ -38,6 +38,10 @@ ADB = os.environ.get('ANDROID_SDK_ROOT', os.path.expanduser('~/Library/Android/s
 EMU = os.environ.get('EMUXR2_SERIAL', 'emulator-5554')
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, '..', 'input', 'out')
+VTENC = os.path.join(OUT, 'vtenc')   # built from bridge/vtenc.c (bridge/build_vtenc.sh)
+# EMUXR2_VTENC_QOS=utility keeps it on the efficiency cores: games gain a little (Ape Sprint 40 -> 42 fps), the stream
+# drops to ~60 fps
+VTENC_QOS = ['taskpolicy', '-c', 'utility'] if os.environ.get('EMUXR2_VTENC_QOS') == 'utility' else []
 INJECTOR_PORT, QUEST_PORT, AUDIO_PORT = 7791, 9945, 7793
 AUDIO_CHUNK = 1920   # 10 ms of 48 kHz stereo s16le (common/vr4mac.h VR4_AUDIO)
 
@@ -60,6 +64,7 @@ FOV = [[-math.radians(l), math.radians(r), math.radians(u), -math.radians(d)]
 MESH = '/data/local/tmp/emuxr2-mesh.bin'
 MARK_BLOCKS, MARK = 36, 8   # pose-number stamp: 36 blocks of 8x8 px along the bottom-left edge
 FPS, BITRATE = 60, 40_000_000
+CONVERT_THREADS = int(os.environ.get('EMUXR2_CONVERT_THREADS', '2'))
 DEFAULT_PROF = {'codec': 'h264', 'eye_w': EYE_W, 'eye_h': ENC_H,
                 'fps': FPS, 'bitrate': BITRATE, 'device': 'default'}
 LOG = open('/tmp/emuxr2-stream.log', 'a', buffering=1)
@@ -193,6 +198,7 @@ def Display():
 
 class ShmDisplay:
     """The emulator's shared framebuffer: header (width, height, fps, frame counter, ...) then BGRA pixels."""
+    layout = 'bgra'   # byte order of the frames grab() returns; current() is always BGRA
 
     def __init__(self):
         result = adb('emu', 'screenrecord', 'webrtc', 'start', '72')
@@ -215,10 +221,13 @@ class ShmDisplay:
         n = self.counter()
         if n == last:
             return last, None
-        img = self.snapshot()
+        img = self.raw_snapshot()
         if self.counter() != n:   # written while copying: take the next one
             return last, None
         return n, img
+
+    def raw_snapshot(self):
+        return self.snapshot()
 
     def snapshot(self):
         """Own one upright snapshot; rotating the shared view before copying avoids a second full-frame copy."""
@@ -259,23 +268,29 @@ class GrpcDisplay(ShmDisplay):
         f = open(self.path, 'r+b')
         self.m = mmap.mmap(f.fileno(), w * h * 4, access=mmap.ACCESS_READ)
         f.close()
-        self.w, self.h, self.seq = w, h, 0
+        self.w, self.h = w, h
         self.px = np.frombuffer(self.m, np.uint32, w * h).reshape(h, w)
-        self.fmt = pb.ImageFormat(format=pb.ImageFormat.RGBA8888, transport=pb.ImageTransport(
-            channel=pb.ImageTransport.MMAP, handle='file://' + self.path))
-        threading.Thread(target=self._follow, daemon=True).start()
+        with open(self.path + '.seq', 'wb') as f:
+            f.truncate(8)
+        f = open(self.path + '.seq', 'r+b')
+        self.seq_map = mmap.mmap(f.fileno(), 8, access=mmap.ACCESS_READ)
+        f.close()
+        # received in a process of its own (grpc_follow.py): see there why
+        env = dict(os.environ, EMUXR2_GRPC_TOKEN=token or '')
+        self.follower = subprocess.Popen([sys.executable, os.path.join(HERE, 'grpc_follow.py'), str(port), self.path],
+                                         stdin=subprocess.PIPE, env=env)
 
-    def _follow(self):
-        while True:
-            try:
-                for img in self.stub.streamScreenshot(self.fmt, metadata=self.auth):
-                    self.seq += 1
-            except Exception as e:   # emulator restarting: keep trying
-                log('gRPC display stream ended:', e)
-                time.sleep(1)
+    @property
+    def seq(self):
+        return struct.unpack('<Q', self.seq_map[:8])[0]
 
     def counter(self):
         return self.seq
+
+    layout = 'rgba'   # grab() hands the stream RGBA as it comes (the encoder converts either); current() swaps
+
+    def raw_snapshot(self):
+        return pixels.snapshot(self.px)
 
     def snapshot(self):
         return pixels.rgba_to_bgra(pixels.snapshot(self.px))
@@ -622,11 +637,14 @@ class Session:
         """Encode one full-res padded frame and send it as VIDEO."""
         begin = time.monotonic() if self.profile else 0
         fw, fh = self.prof['eye_w'] * 2, self.prof['eye_h']
-        frame = av.VideoFrame.from_numpy_buffer(pixels.view(np.uint8).reshape(ENC_H, CAP_W, 4), format='bgra')
+        layout = getattr(self.display, 'layout', 'bgra')
+        frame = av.VideoFrame.from_numpy_buffer(pixels.view(np.uint8).reshape(ENC_H, CAP_W, 4), format=layout)
+        # a few converter threads: one per core spin on every frame and take the emulator's performance cores
         if (fw, fh) == (CAP_W, ENC_H):
-            frame = self.reformatter.reformat(frame, format=self.encoder.pix_fmt)
+            frame = self.reformatter.reformat(frame, format=self.encoder.pix_fmt, threads=CONVERT_THREADS)
         else:
-            frame = self.reformatter.reformat(frame, width=fw, height=fh, format=self.encoder.pix_fmt)
+            frame = self.reformatter.reformat(frame, width=fw, height=fh, format=self.encoder.pix_fmt,
+                                              threads=CONVERT_THREADS)
         if self.gain < 0.995:   # Horizon's brightness slider: luma scaled, chroma pulled toward neutral
             luma, chroma = dim_tables(self.gain)
             for i, lut in enumerate((luma, chroma, chroma)):
@@ -724,7 +742,110 @@ class Session:
                 self.enc_error = e
                 return
 
+    def _watchdog(self, now):
+        """No stamped frames for 10 s: (when to look again, whether the headset is just idle)."""
+        # A rebooted guest has lost our helpers (no head pose: nothing draws); restarting only the runtime
+        # would kill the running app's VR session every 40 s.
+        if adb('shell', 'pgrep -f [I]njector').returncode != 0:
+            log('no stamped frames and no guest injector (guest rebooted?): restarting guest helpers')
+            start_guest()
+        elif now - self.pose_at > 2:
+            return now, True      # headset idle (taken off, asleep): no poses, so no frames; not a hang
+        else:
+            log('no stamped frames for 10 s: restarting the guest VR runtime')
+            restart_runtime()
+        return now + 30, False
+
+    def _native(self):
+        """Whether the native frame path (vtenc) serves this stream: gRPC display, H.264 at the display's size."""
+        return (os.environ.get('EMUXR2_NATIVE') != '0' and hasattr(self.display, 'path') and
+                os.path.exists(VTENC) and self.prof.get('codec') == 'h264' and
+                (self.prof['eye_w'] * 2, self.prof['eye_h']) == (CAP_W, ENC_H))
+
+    def _native_loop(self):
+        """Frames go display -> vtenc -> here: rotation, conversion and encoding in native code (bridge/vtenc.c),
+        off the emulator's performance cores; this maps each frame's stamp to its pose and sends it."""
+        helper, cfg, records = None, None, queue.Queue()
+        sent_idle = sent_gain = None
+        stamped_at, last_seen, n, t0 = time.monotonic(), None, 0, time.monotonic()
+
+        def read(out, q):
+            def exact(k):
+                b = out.read(k)
+                if len(b) != k:
+                    raise EOFError
+                return b
+            try:
+                while True:
+                    kind = exact(1)[0]
+                    if kind == 1:
+                        length, stamp, key = struct.unpack('<IqB', exact(13))
+                        q.put((1, stamp, key, exact(length)))
+                    else:
+                        q.put((2,) + struct.unpack('<qII', exact(16)))
+            except (EOFError, OSError, ValueError):
+                q.put(None)
+        try:
+            while not self.stop:
+                try:
+                    self.configure(self.hellos.get_nowait())
+                except queue.Empty:
+                    pass
+                if self.encoder is None:
+                    time.sleep(0.01)
+                    continue
+                want = (self.prof['eye_w'] * 2, self.prof['eye_h'], self.prof['fps'], self.prof['bitrate'])
+                if helper is None or cfg != want or helper.poll() is not None:
+                    if helper is not None:
+                        helper.kill()
+                        log('vtenc restarted' if cfg == want else 'vtenc reconfigured')
+                    records = queue.Queue()
+                    helper = subprocess.Popen([*VTENC_QOS, VTENC, self.display.path, *map(str, want)], stdin=subprocess.PIPE,
+                                              stdout=subprocess.PIPE)
+                    threading.Thread(target=read, args=(helper.stdout, records), daemon=True).start()
+                    cfg, sent_idle, sent_gain, self.need_idr = want, None, None, False
+                commands = []
+                idle = time.monotonic() - self.pose_at > 2
+                if idle != sent_idle:
+                    commands.append(f'idle {int(idle)}'); sent_idle = idle
+                if self.gain != sent_gain:
+                    commands.append(f'gain {self.gain}'); sent_gain = self.gain
+                if self.need_idr:
+                    commands.append('idr'); self.need_idr = False
+                if commands:
+                    try:
+                        helper.stdin.write(('\n'.join(commands) + '\n').encode()); helper.stdin.flush()
+                    except OSError:
+                        pass
+                try:
+                    rec = records.get(timeout=0.05)
+                except queue.Empty:
+                    rec = ()
+                now = time.monotonic()
+                if rec is None:
+                    helper.kill()
+                    time.sleep(0.2)
+                elif rec and rec[0] == 1:
+                    _, stamp, key, data = rec
+                    when = self.times.get(stamp, 0) if stamp >= 0 else 0   # an unknown pose: decoded, not shown
+                    self.send(4, struct.pack('<QQB', self.frame_id, when, key) + data)
+                    self.frame_id += 1
+                    n += 1
+                elif rec and rec[0] == 2:
+                    if rec[1] >= 0 and rec[1] != last_seen:
+                        stamped_at, last_seen = now, rec[1]
+                if now - stamped_at > 10:
+                    stamped_at, _ = self._watchdog(now)
+                if now - t0 >= 5:
+                    log(f'video: {n / (now - t0):.1f} fps @{CAP_W}x{ENC_H} (native)')
+                    n, t0 = 0, now
+        finally:
+            if helper is not None:
+                helper.kill()
+
     def _run(self):
+        if self._native():
+            return self._native_loop()
         encoder = threading.Thread(target=self._encode_loop, daemon=True)
         encoder.start()
         try:
@@ -756,18 +877,9 @@ class Session:
             # No stamped frames for 10 s: the compositor hung (acquiring a window buffer, say; the display then
             # freezes) or died. Restart the runtime; keepalive frames hold the headset connected meanwhile.
             if now - stamped_at > 10:
-                # A rebooted guest has lost our helpers (no head pose: nothing draws); restarting only the runtime
-                # would kill the running app's VR session every 40 s.
-                if adb('shell', 'pgrep -f [I]njector').returncode != 0:
-                    log('no stamped frames and no guest injector (guest rebooted?): restarting guest helpers')
-                    start_guest()
-                elif now - self.pose_at > 2:
-                    stamped_at = now      # headset idle (taken off, asleep): no poses, so no frames; not a hang
+                stamped_at, idle = self._watchdog(now)
+                if idle:
                     continue
-                else:
-                    log('no stamped frames for 10 s: restarting the guest VR runtime')
-                    restart_runtime()
-                stamped_at = now + 30
             if img is None:
                 # frozen display (idle scene): keep a frame a second flowing, or the
                 # client times out and flaps through HELLO/CONFIG re-handshakes.
