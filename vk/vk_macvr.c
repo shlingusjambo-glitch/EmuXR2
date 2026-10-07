@@ -640,6 +640,18 @@ static VkResult AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *ai, con
 
 static void FreeMemory(VkDevice dev, VkDeviceMemory mem, const VkAllocationCallbacks *a) {
     Dev *d = findDev(dev);
+    // ANGLE can import array memory without ever binding an image (its 3D external-storage
+    // entry point is incomplete). Those deferred imports still own Android buffers and an fd.
+    Recv orphan = {0}; orphan.genFd = -1;
+    pthread_mutex_lock(&lock);
+    for (int i = 0; i < 64; i++) if (pending[i].dev == dev && pending[i].mem == mem) {
+        orphan = pending[i].rv;
+        memset(&pending[i], 0, sizeof pending[i]);
+        break;
+    }
+    pthread_mutex_unlock(&lock);
+    for (uint32_t i = 0; i < orphan.n; i++) AHardwareBuffer_release(orphan.buf[i]);
+    if (orphan.genFd >= 0) close(orphan.genFd);
     pthread_mutex_lock(&lock); Shared *s = byMem(mem); pthread_mutex_unlock(&lock);
     if (s) {   // drop the shadows with the memory; the image may get new memory later
         for (int f = 0; f < 8; f++) {

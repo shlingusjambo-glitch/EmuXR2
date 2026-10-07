@@ -264,6 +264,7 @@ void glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei inst
 }
 FWD(glImportMemoryFdEXT, "macvr_ImportMemoryFd", (GLuint m, GLuint64 s, GLenum t, GLint fd), (m, s, t, fd))
 FWD(glDeleteMemoryObjectsEXT, "macvr_DeleteMemoryObjects", (GLsizei n, const GLuint *ids), (n, ids))
+FWD(glDeleteTextures, "macvr_DeleteTextures", (GLsizei n, const GLuint *ids), (n, ids))
 FWD(glTexStorageMem2DEXT, "macvr_TexStorageMem2D", (GLenum t, GLsizei l, GLenum f_, GLsizei w, GLsizei h, GLuint m, GLuint64 o), (t, l, f_, w, h, m, o))
 FWD(glTexStorageMem3DEXT, "macvr_TexStorageMem3D", (GLenum t, GLsizei l, GLenum f_, GLsizei w, GLsizei h, GLsizei d, GLuint m, GLuint64 o), (t, l, f_, w, h, d, m, o))
 FWD(glTextureViewOES, "macvr_TextureView", (GLuint v, GLenum t, GLuint o, GLenum f_, GLuint ml, GLuint nl, GLuint mly, GLuint nly), (v, t, o, f_, ml, nl, mly, nly))
@@ -307,15 +308,29 @@ GLenum glCheckFramebufferStatus(GLenum target) {
 // framebuffer attachments: arrays emulated in libEGL_macvr need copying out once rendered (and failures are logged)
 // Apps that attach once and then rebind the framebuffer every frame (Unity) re-dirty the array on each draw binding.
 static void noteAttach(GLuint tex) { static void (*f)(GLuint); if (!f) f = eglShim("macvr_NoteAttach"); if (f) f(tex); }
+static EGLContext currentContext(void) {
+    static EGLContext (*f)(void);
+    if (!f) f = eglShim("eglGetCurrentContext");
+    return f ? f() : EGL_NO_CONTEXT;
+}
 #define MAXFB 64
-static struct { GLuint fb, tex; } fbTex[MAXFB];   // draw framebuffer -> colour texture attached to it
+static struct { GLuint fb, tex; EGLContext ctx; } fbTex[MAXFB];   // draw framebuffer -> colour texture attached to it
 static void rememberAttach(GLenum target, GLenum att, GLuint tex) {
     if (target == GL_READ_FRAMEBUFFER || att != GL_COLOR_ATTACHMENT0) return;
     GLint fb = 0; glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fb);
     if (!fb) return;
+    EGLContext ctx = currentContext();
     int slot = -1;
-    for (int i = 0; i < MAXFB; i++) { if (fbTex[i].fb == (GLuint)fb) { slot = i; break; } if (slot < 0 && !fbTex[i].fb) slot = i; }
-    if (slot >= 0) { fbTex[slot].fb = fb; fbTex[slot].tex = tex; }
+    for (int i = 0; i < MAXFB; i++) { if (fbTex[i].fb == (GLuint)fb && fbTex[i].ctx == ctx) { slot = i; break; } if (slot < 0 && !fbTex[i].fb) slot = i; }
+    if (slot >= 0) { fbTex[slot].fb = fb; fbTex[slot].tex = tex; fbTex[slot].ctx = ctx; }
+}
+void glDeleteFramebuffers(GLsizei n, const GLuint *ids) {
+    static void (*f)(GLsizei, const GLuint *);
+    if (!f) f = dlsym(RTLD_NEXT, "glDeleteFramebuffers");
+    EGLContext ctx = currentContext();
+    for (GLsizei j = 0; j < n; j++) for (int i = 0; i < MAXFB; i++)
+        if (fbTex[i].fb == ids[j] && fbTex[i].ctx == ctx) memset(&fbTex[i], 0, sizeof fbTex[i]);
+    f(n, ids);
 }
 // framebuffer 0 for Meta's compositor is its front buffer (libEGL_macvr's macvr_FrontFramebuffer)
 static GLuint frontFramebuffer(void) {
@@ -327,7 +342,7 @@ void glBindFramebuffer(GLenum target, GLuint fb) {
     static void (*f)(GLenum, GLuint); if (!f) f = dlsym(RTLD_NEXT, "glBindFramebuffer");
     if (!fb) fb = frontFramebuffer();
     f(target, fb);
-    if (fb && target != GL_READ_FRAMEBUFFER) for (int i = 0; i < MAXFB; i++) if (fbTex[i].fb == fb) { if (fbTex[i].tex) noteAttach(fbTex[i].tex); break; }
+    if (fb && target != GL_READ_FRAMEBUFFER) for (int i = 0; i < MAXFB; i++) if (fbTex[i].fb == fb && fbTex[i].ctx == currentContext()) { if (fbTex[i].tex) noteAttach(fbTex[i].tex); break; }
 }
 #define ATTACH(name, params, args, tex, fmt, ...) void name params { static void (*f) params; static GLenum (*err)(void); \
     if (!f) { f = dlsym(RTLD_NEXT, #name); err = dlsym(RTLD_NEXT, "glGetError"); } \

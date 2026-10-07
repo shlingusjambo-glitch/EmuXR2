@@ -294,7 +294,7 @@ static int isDepthBuffer(AHardwareBuffer *b) {
     return d.format >= AHARDWAREBUFFER_FORMAT_D16_UNORM && d.format <= AHARDWAREBUFFER_FORMAT_S8_UINT;
 }
 typedef struct { GLuint id; Recv rv; } MemObj;
-typedef struct { GLuint tex, mem; } TexMem;
+typedef struct { GLuint tex, mem; EGLContext ctx; } TexMem;
 static MemObj mems[256]; static TexMem texs[1024];
 static pthread_mutex_t vlock = PTHREAD_MUTEX_INITIALIZER;
 static MemObj *memObj(GLuint id) { for (int i = 0; i < 256; i++) if (mems[i].id == id) return &mems[i]; return NULL; }
@@ -303,7 +303,7 @@ static void noteTex(GLuint tex, GLuint mem) {
     pthread_mutex_lock(&vlock);
     int k = -1;
     for (int i = 0; i < 1024; i++) { if (texs[i].tex == tex) { k = i; break; } if (k < 0 && !texs[i].tex) k = i; }
-    if (k >= 0) texs[k] = (TexMem){tex, mem};
+    if (k >= 0) texs[k] = (TexMem){tex, mem, eglGetCurrentContext()};
     pthread_mutex_unlock(&vlock);
 }
 static GLuint boundTex(GLenum target) {
@@ -345,17 +345,47 @@ __attribute__((visibility("default"))) void macvr_TexStorageMem2D(GLenum t, GLsi
 #include <sys/mman.h>
 #define MAXARR 64
 static int isSrgb(GLenum f) { return f == GL_SRGB8_ALPHA8 || f == GL_SRGB8 || f == 0x8FBD /* GL_SR8_EXT */; }
+typedef struct { atomic_uint refs; volatile atomic_uint *value; } GenRef;
+static GenRef *genMap(int fd) {
+    void *value = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (value == MAP_FAILED) return NULL;
+    GenRef *ref = malloc(sizeof *ref);
+    if (!ref) { munmap(value, 4096); return NULL; }
+    atomic_init(&ref->refs, 1); ref->value = value;
+    return ref;
+}
+static void genRelease(GenRef *ref) {
+    if (ref && atomic_fetch_sub(&ref->refs, 1) == 1) { munmap((void *)ref->value, 4096); free(ref); }
+}
 typedef struct { GLuint tex; EGLContext ctx; int dirty; GLenum fmt; uint32_t layers, w, h, mips; AHardwareBuffer *buf[MAXSH]; GLuint layerTex[MAXSH];
-                 volatile atomic_uint *gen; } Arr;
+                 GenRef *gen; } Arr;
 static Arr arrs[MAXARR];
+typedef struct { int fd; GenRef *gen[MAXARR]; int n; } GenJob;
+static void releaseArray(Arr *a) {
+    for (uint32_t i = 0; i < MAXSH; i++) if (a->buf[i]) AHardwareBuffer_release(a->buf[i]);
+    ((void (*)(GLsizei, const GLuint *))gl("glDeleteTextures"))(MAXSH, a->layerTex);
+    genRelease(a->gen);
+    memset(a, 0, sizeof *a);
+}
+__attribute__((visibility("default"))) void macvr_DeleteTextures(GLsizei n, const GLuint *ids) {
+    EGLContext ctx = eglGetCurrentContext();
+    pthread_mutex_lock(&vlock);
+    for (GLsizei k = 0; k < n; k++) {
+        if (!ids[k]) continue;
+        for (int i = 0; i < MAXARR; i++) if (arrs[i].tex == ids[k] && arrs[i].ctx == ctx) releaseArray(&arrs[i]);
+        for (int i = 0; i < 1024; i++) if (texs[i].tex == ids[k] && texs[i].ctx == ctx) memset(&texs[i], 0, sizeof texs[i]);
+    }
+    pthread_mutex_unlock(&vlock);
+    ((void (*)(GLsizei, const GLuint *))gl("glDeleteTextures"))(n, ids);
+}
 static void *genWorker(void *u) {   // fd of a native fence, then the counter to bump once it signals
     int p = (int)(intptr_t)u;
     for (;;) {
-        struct { int fd; volatile atomic_uint *gen[MAXARR]; int n; } j;
+        GenJob j;
         if (read(p, &j, sizeof j) != sizeof j) continue;
         struct pollfd pf = {j.fd, POLLIN, 0};
         if (j.fd >= 0) { poll(&pf, 1, 1000); close(j.fd); }
-        for (int i = 0; i < j.n; i++) atomic_fetch_add(j.gen[i], 1);
+        for (int i = 0; i < j.n; i++) { atomic_fetch_add(j.gen[i]->value, 1); genRelease(j.gen[i]); }
     }
     return NULL;
 }
@@ -375,12 +405,10 @@ __attribute__((visibility("default"))) void macvr_TexStorageMem3D(GLenum t, GLsi
                 f == GL_DEPTH32F_STENCIL8 || f == GL_STENCIL_INDEX8;
     if (depth) a = NULL;   // depth layers aren't shown, and the host can't wrap a depth buffer as a color image
     if (a && mo && mo->rv.n >= (uint32_t)d) {
-        for (uint32_t i = 0; i < MAXSH; i++) if (a->buf[i]) AHardwareBuffer_release(a->buf[i]);
-        if (a->gen) munmap((void *)a->gen, 4096);
-        memset(a, 0, sizeof *a);
+        releaseArray(a);
         a->tex = tex; a->ctx = eglGetCurrentContext(); a->fmt = f; a->layers = d; a->w = w; a->h = h; a->mips = mo->rv.mips ? mo->rv.mips : 1;
         for (uint32_t i = 0; i < mo->rv.n && i < MAXSH; i++) { a->buf[i] = mo->rv.buf[i]; AHardwareBuffer_acquire(a->buf[i]); }
-        if (mo->rv.genFd >= 0) { void *g = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, mo->rv.genFd, 0); if (g != MAP_FAILED) a->gen = g; }
+        if (mo->rv.genFd >= 0) a->gen = genMap(mo->rv.genFd);
         LOG("texture %u: %dx%dx%d array over %u shared layers%s", tex, w, h, d, mo->rv.n, a->gen ? "" : " (no counter)");
     } else LOG("texture %u: array storage only (format 0x%x, memory %u has %u buffers)", tex, f, m, mo ? mo->rv.n : 0);
     pthread_mutex_unlock(&vlock);
@@ -397,7 +425,7 @@ __attribute__((visibility("default"))) void macvr_FlushArrays(void) {
     EGLContext ctx = eglGetCurrentContext();
     if (ctx == EGL_NO_CONTEXT) return;
     present();
-    struct { int fd; volatile atomic_uint *gen[MAXARR]; int n; } j = {-1, {0}, 0};
+    GenJob j = {-1, {0}, 0};
     pthread_mutex_lock(&vlock);
     for (int i = 0; i < MAXARR; i++) {
         Arr *a = &arrs[i];
@@ -425,14 +453,21 @@ __attribute__((visibility("default"))) void macvr_FlushArrays(void) {
                 a->tex, GL_TEXTURE_2D_ARRAY, 0, 0, 0, L, a->layerTex[L], GL_TEXTURE_2D, 0, 0, 0, 0, a->w, a->h, 1);
             { static int n; GLenum e = ((GLenum (*)(void))gl("glGetError"))(); if (e && n++ < 4) LOG("texture %u layer %u copy (format 0x%x): GL error 0x%x", a->tex, L, a->fmt, e); }
         }
-        if (a->gen && j.n < MAXARR) j.gen[j.n++] = a->gen;
+        if (a->gen && j.n < MAXARR) { atomic_fetch_add(&a->gen->refs, 1); j.gen[j.n++] = a->gen; }
     }
     pthread_mutex_unlock(&vlock);
     if (!j.n) return;
     static int pipeFd[2] = {-1, -1};
     if (pipeFd[0] < 0) {
         pthread_t th;
-        if (pipe(pipeFd) || pthread_create(&th, NULL, genWorker, (void *)(intptr_t)pipeFd[0])) { LOG("no generation worker"); return; }
+        if (pipe(pipeFd) || pthread_create(&th, NULL, genWorker, (void *)(intptr_t)pipeFd[0])) {
+            LOG("no generation worker");
+            for (int i = 0; i < j.n; i++) genRelease(j.gen[i]);
+            if (pipeFd[0] >= 0) close(pipeFd[0]);
+            if (pipeFd[1] >= 0) close(pipeFd[1]);
+            pipeFd[0] = pipeFd[1] = -1;
+            return;
+        }
         pthread_detach(th);
     }
     EGLDisplay dpy = eglGetCurrentDisplay();
@@ -442,7 +477,11 @@ __attribute__((visibility("default"))) void macvr_FlushArrays(void) {
         j.fd = ((EGLint (*)(EGLDisplay, EGLSyncKHR))real("eglDupNativeFenceFDANDROID"))(dpy, sync);
         ((EGLBoolean (*)(EGLDisplay, EGLSyncKHR))real("eglDestroySyncKHR"))(dpy, sync);
     }
-    write(pipeFd[1], &j, sizeof j);
+    if (write(pipeFd[1], &j, sizeof j) != sizeof j) {
+        if (j.fd >= 0) close(j.fd);
+        for (int i = 0; i < j.n; i++) genRelease(j.gen[i]);
+        LOG("generation job enqueue failed");
+    }
 }
 // the app's fences: its frame is done
 EGLSyncKHR eglCreateSyncKHR(EGLDisplay d, EGLenum type, const EGLint *attr) {
@@ -657,7 +696,7 @@ __eglMustCastToProperFunctionPointerType eglGetProcAddress(const char *name) {
     if (!f) f = real("eglGetProcAddress");
     if (!strcmp(name,"glMapBufferRange") || !strcmp(name,"glUnmapBuffer") || !strcmp(name,"glGetBufferParameteriv") || !strcmp(name,"glDeleteProgram") || !strcmp(name,"glTexBufferEXT") || !strcmp(name,"glTexBuffer") || !strcmp(name,"glBindTexture") || !strcmp(name,"glActiveTexture") || !strcmp(name,"glBindBuffer") || !strcmp(name,"glBufferData") || !strcmp(name,"glBufferSubData") || !strcmp(name,"glUseProgram") || !strcmp(name,"glUniform1i") || !strcmp(name, "glShaderSource") || !strcmp(name, "glCompileShader") || !strcmp(name, "glGetActiveUniformBlockiv") || !strcmp(name, "glValidateProgram") || !strcmp(name, "glLinkProgram") || !strcmp(name, "glProgramBinary") ||
         !strcmp(name, "glFramebufferTextureMultiviewOVR") || !strcmp(name, "glFramebufferTextureMultisampleMultiviewOVR") ||
-        !strcmp(name, "glBindFramebuffer") || !strcmp(name, "glFenceSync") ||
+        !strcmp(name, "glBindFramebuffer") || !strcmp(name, "glDeleteFramebuffers") || !strcmp(name, "glFenceSync") ||
         !strcmp(name, "glInvalidateFramebuffer") || !strcmp(name, "glDiscardFramebufferEXT") ||
         !strcmp(name, "glGetFramebufferAttachmentParameteriv")) {
         void *shim = dlopen("libGLESv2_macvr.so", RTLD_NOW | RTLD_NOLOAD);
@@ -677,6 +716,7 @@ __eglMustCastToProperFunctionPointerType eglGetProcAddress(const char *name) {
     if (!strcmp(name, "eglCreateSync")) return (__eglMustCastToProperFunctionPointerType)eglCreateSync;
     if (!strcmp(name, "glImportMemoryFdEXT")) return (__eglMustCastToProperFunctionPointerType)macvr_ImportMemoryFd;
     if (!strcmp(name, "glDeleteMemoryObjectsEXT")) return (__eglMustCastToProperFunctionPointerType)macvr_DeleteMemoryObjects;
+    if (!strcmp(name, "glDeleteTextures")) return (__eglMustCastToProperFunctionPointerType)macvr_DeleteTextures;
     if (!strcmp(name, "glTexStorageMem2DEXT")) return (__eglMustCastToProperFunctionPointerType)macvr_TexStorageMem2D;
     if (!strcmp(name, "glTexStorageMem3DEXT")) return (__eglMustCastToProperFunctionPointerType)macvr_TexStorageMem3D;
     if (!strcmp(name, "glTextureStorageMem2DEXT")) return (__eglMustCastToProperFunctionPointerType)TextureStorageMem2D;

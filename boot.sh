@@ -7,7 +7,7 @@ pids=$(pgrep -f 'qemu-system-aarch64.*-avd horizon( |$)' || true)
 if [ -n "$pids" ]; then
     # Flush guest filesystem writes before terminating QEMU. Otherwise recent settings
     # and directory changes can disappear even though their adb commands succeeded.
-    perl -e 'alarm 15; exec @ARGV' "$HOME/Library/Android/sdk/platform-tools/adb" shell sync >/dev/null 2>&1 || true
+    perl -e 'alarm 15; exec @ARGV' "$HOME/Library/Android/sdk/platform-tools/adb" -s "${EMUXR2_SERIAL:-emulator-5554}" shell sync >/dev/null 2>&1 || true
     kill $pids 2>/dev/null || true
     for attempt in 1 2 3 4 5 6 7 8 9 10; do
         alive=0
