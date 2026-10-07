@@ -19,8 +19,7 @@ from your Mac.
 > runs at 41–55 fps. Next: steadier frame rates in heavy scenes and smoother head turns. See
 > [PROGRESS.md](PROGRESS.md).
 
-EmuXR2 ships **no** Meta code or assets. You provide a Quest firmware image (OTA zip) you legally own;
-everything taken from it stays on your machine.
+You'll need a V54 OTA.
 
 ## Screenshots
 
